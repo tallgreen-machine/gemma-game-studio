@@ -180,6 +180,27 @@ async def api_add_reminder(request):
         await conn.execute("INSERT INTO reminders (note) VALUES ($1)", note)
     return web.json_response({"status": "ok"})
 
+async def api_get_manifesto(request):
+    """Serve the content of manifesto.md."""
+    try:
+        if os.path.exists('manifesto.md'):
+            with open('manifesto.md', 'r') as f:
+                return web.json_response({"content": f.read()})
+        return web.json_response({"content": "Manifesto not found."}, status=404)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def api_get_journal(request):
+    """Serve the content of journal.md from the workspace."""
+    try:
+        journal_path = 'game_workspace/journal.md'
+        if os.path.exists(journal_path):
+            with open(journal_path, 'r') as f:
+                return web.json_response({"content": f.read()})
+        return web.json_response({"content": "Journal not found."}, status=404)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
 app = web.Application(middlewares=[api_auth_middleware])
 app.on_startup.append(init_db)
 app.on_cleanup.append(close_db)
@@ -196,6 +217,8 @@ app.add_routes([
     web.post('/api/state', api_update_state),
     web.get('/api/reminders', api_get_reminders),
     web.post('/api/reminders', api_add_reminder),
+    web.get('/api/manifesto', api_get_manifesto),
+    web.get('/api/journal', api_get_journal),
     web.static('/media', 'media')
 ])
 

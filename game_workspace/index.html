@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aetheria - Retro Cinematic RPG</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        canvas {
+            border: 2px solid #333;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+        #ui-overlay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            pointer-events: none;
+            text-shadow: 2px 2px #000;
+        }
+        #dialogue-input-container {
+            position: absolute;
+            bottom: 120px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: none; /* Controlled by DialogueSystem */
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            width: 600px;
+            z-index: 100;
+        }
+        #player-input {
+            width: 100%;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            border: 1px solid #444;
+            color: #fff;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 16px;
+            outline: none;
+        }
+        #player-input:focus {
+            border-color: #00FF00;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-overlay">
+        <h1>AETHERIA</h1>
+        <p>WASD to Move | E to Interact</p>
+    </div>
+
+    <div id="dialogue-input-container">
+        <input type="text" id="player-input" placeholder="Type your response..." autocomplete="off">
+    </div>
+
+    <script type="module" src="/src/client/main.ts"></script>
+</body>
+</html>

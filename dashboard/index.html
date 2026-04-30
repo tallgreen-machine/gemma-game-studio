@@ -49,11 +49,16 @@
             padding: 15px;
             font-family: 'Fira Code', monospace;
             font-size: 13px;
-            color: #00ff00;
+            color: #50fa7b; /* Dracul-style green */
             overflow-y: auto;
             white-space: pre-wrap;
             box-shadow: inset 0 0 10px rgba(0,255,0,0.05);
         }
+
+        .log-header { color: #bd93f9; font-weight: bold; display: block; margin-top: 15px; margin-bottom: 5px; font-size: 14px; border-bottom: 1px solid rgba(189, 147, 249, 0.3); }
+        .log-cmd { color: #f1fa8c; }
+        .log-err { color: #ff5555; font-weight: bold; }
+        .log-info { color: #8be9fd; }
 
         /* Chat Panel */
         #chat-panel {
@@ -156,19 +161,102 @@
         }
 
         h2 {
-            margin-top: 0;
+            margin: 0;
             font-size: 16px;
             text-transform: uppercase;
             letter-spacing: 1px;
             color: var(--text-dim);
+        }
+
+        .header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             margin-bottom: 15px;
         }
+
+        /* Modal Styles */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.8);
+            backdrop-filter: blur(5px);
+        }
+
+        .modal-content {
+            background-color: var(--panel-bg);
+            margin: 5% auto;
+            padding: 30px;
+            border: 1px solid var(--accent);
+            width: 80%;
+            max-width: 900px;
+            height: 70vh;
+            border-radius: 15px;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 0 30px var(--accent-glow);
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .modal-body {
+            flex: 1;
+            overflow-y: auto;
+            background: #000;
+            padding: 20px;
+            border-radius: 8px;
+            font-family: 'Inter', sans-serif;
+            white-space: pre-wrap;
+            line-height: 1.6;
+            color: #ccc;
+        }
+
+        .tab-btns {
+            display: flex;
+            gap: 10px;
+        }
+
+        .tab-btn {
+            padding: 8px 15px;
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            cursor: pointer;
+            border-radius: 4px;
+        }
+
+        .tab-btn.active {
+            background: var(--accent-glow);
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .close-btn {
+            color: var(--text-dim);
+            font-size: 28px;
+            cursor: pointer;
+        }
+
+        .close-btn:hover { color: #fff; }
     </style>
 </head>
 <body>
 
     <div class="panel" id="logs-panel">
-        <h2>Live Mac Supervisor Logs</h2>
+        <div class="header-row">
+            <h2>Live Mac Supervisor Logs</h2>
+            <button id="intel-btn" style="padding: 5px 12px; font-size: 12px; background: transparent; border: 1px solid var(--accent); color: var(--accent);">PROJECT INTEL</button>
+        </div>
         <div id="terminal">System Initialized. Waiting for connection...
 </div>
     </div>
@@ -181,6 +269,20 @@
         <div id="media-gallery">
             <!-- Screenshots appear here -->
         </div>
+
+    <!-- Modal -->
+    <div id="intel-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="tab-btns">
+                    <button class="tab-btn active" id="tab-manifesto">PRIME DIRECTIVE</button>
+                    <button class="tab-btn" id="tab-journal">PROJECT JOURNAL</button>
+                </div>
+                <span class="close-btn" id="close-modal">&times;</span>
+            </div>
+            <div class="modal-body" id="modal-text">Loading...</div>
+        </div>
+    </div>
         <div class="chat-input-container">
             <input type="text" id="chat-input" placeholder="Give an instruction or pivot command..." autocomplete="off">
             <button id="send-btn">SEND</button>
@@ -205,7 +307,29 @@
                 const data = JSON.parse(event.data);
                 
                 if (data.type === 'log') {
-                    terminal.textContent += data.text + '\n';
+                    const line = document.createElement('div');
+                    const text = data.text;
+                    
+                    if (text.includes('--- Starting Iteration')) {
+                        line.className = 'log-header';
+                    } else if (text.startsWith('Executing Natively:')) {
+                        line.className = 'log-cmd';
+                    } else if (text.includes('ERROR') || text.includes('failed') || text.includes('Error')) {
+                        line.className = 'log-err';
+                    } else if (text.startsWith('Native Result:')) {
+                        line.className = 'log-info';
+                    } else if (text.startsWith('Querying Gemma 4')) {
+                        line.style.color = '#ffb86c'; // Orange
+                        line.style.fontStyle = 'italic';
+                    } else if (text.startsWith('Gemma 4 Output:')) {
+                        line.style.color = '#f8f8f2';
+                        line.style.borderLeft = '2px solid var(--accent)';
+                        line.style.paddingLeft = '10px';
+                        line.style.marginTop = '10px';
+                    }
+                    
+                    line.textContent = text;
+                    terminal.appendChild(line);
                     terminal.scrollTop = terminal.scrollHeight;
                 } else if (data.type === 'agent_chat') {
                     appendMessage(data.text, 'msg-agent');
@@ -274,6 +398,48 @@
         chatInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') sendMessage();
         });
+
+        // Modal Logic
+        const modal = document.getElementById('intel-modal');
+        const intelBtn = document.getElementById('intel-btn');
+        const closeModal = document.getElementById('close-modal');
+        const modalText = document.getElementById('modal-text');
+        const tabManifesto = document.getElementById('tab-manifesto');
+        const tabJournal = document.getElementById('tab-journal');
+
+        intelBtn.onclick = () => {
+            modal.style.display = "block";
+            fetchContent('/api/manifesto');
+        }
+
+        closeModal.onclick = () => modal.style.display = "none";
+        window.onclick = (event) => { if (event.target == modal) modal.style.display = "none"; }
+
+        async function fetchContent(url) {
+            modalText.textContent = "Loading...";
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+                const res = await fetch(`${protocol}//${window.location.host}${url}`, {
+                    headers: {"X-API-KEY": "epiphany_secret_2026"}
+                });
+                const data = await res.json();
+                modalText.textContent = data.content || "No content found.";
+            } catch (err) {
+                modalText.textContent = "Error loading content.";
+            }
+        }
+
+        tabManifesto.onclick = () => {
+            tabManifesto.classList.add('active');
+            tabJournal.classList.remove('active');
+            fetchContent('/api/manifesto');
+        }
+
+        tabJournal.onclick = () => {
+            tabJournal.classList.add('active');
+            tabManifesto.classList.remove('active');
+            fetchContent('/api/journal');
+        }
     </script>
 </body>
 </html>

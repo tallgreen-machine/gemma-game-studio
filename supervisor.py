@@ -63,10 +63,21 @@ class GemmaSupervisor:
             logger.error(f"Deployment failed: {result.stderr}")
 
     async def execute_native(self, command: str):
-        """Executes a command natively on the Mac within the workspace directory."""
-        # Using shell=True so node/npm commands work from PATH
-        result = subprocess.run(command, shell=True, cwd=WORKSPACE_DIR, capture_output=True, text=True)
-        return result.returncode, result.stdout, result.stderr
+        """Executes a command natively on the Mac within the workspace directory with a timeout."""
+        process = await asyncio.create_subprocess_shell(
+            command,
+            cwd=WORKSPACE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        try:
+            # Wait for 60 seconds max
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+            return process.returncode, stdout.decode(), stderr.decode()
+        except asyncio.TimeoutError:
+            process.kill()
+            return 1, "", "Command timed out after 60 seconds. Do NOT run interactive or watching commands."
 
     def search_web(self, query: str, max_results=3):
         try:
@@ -114,7 +125,14 @@ class GemmaSupervisor:
         payload = {
             "model": MODEL_NAME,
             "prompt": prompt,
-            "stream": False
+            "stream": False,
+            "options": {
+                "num_ctx": 32768,
+                "num_predict": 4096,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "stop": ["Observation:"]
+            }
         }
         async with aiohttp.ClientSession() as session:
             try:
@@ -127,6 +145,12 @@ class GemmaSupervisor:
                         return ""
             except Exception as e:
                 logger.error(f"Connection error to Ollama: {str(e)}")
+                # If we timeout, it might be a memory lock. Try a proactive kill.
+                if "timeout" in str(e).lower() or not str(e):
+                    logger.warning("Potential Memory Lock detected. Flushing Ollama...")
+                    subprocess.run(["pkill", "-9", "ollama"], capture_output=True)
+                    subprocess.run(["pkill", "-9", "ollama serve"], capture_output=True)
+                    subprocess.run(["open", "-a", "Ollama"], capture_output=True)
                 return ""
 
     def read_manifesto(self):
@@ -140,14 +164,16 @@ class GemmaSupervisor:
             f.write(f"\n## Iteration {self.iteration}\n{entry}\n")
 
     def git_commit(self, message: str):
-        subprocess.run(["git", "add", "."], cwd=WORKSPACE_DIR, capture_output=True)
-        subprocess.run(["git", "commit", "-m", message], cwd=WORKSPACE_DIR, capture_output=True)
-        subprocess.run(["git", "push", "origin", "main"], cwd=WORKSPACE_DIR, capture_output=True)
+        root_dir = os.path.dirname(__file__)
+        subprocess.run(["git", "add", "."], cwd=root_dir, capture_output=True)
+        subprocess.run(["git", "commit", "-m", message], cwd=root_dir, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=root_dir, capture_output=True)
         
     def git_reset(self):
+        root_dir = os.path.dirname(__file__)
         logger.warning("Executing 5-fail Git Reset...")
-        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=WORKSPACE_DIR, capture_output=True)
-        subprocess.run(["git", "clean", "-fd"], cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=root_dir, capture_output=True)
+        subprocess.run(["git", "clean", "-fd"], cwd=root_dir, capture_output=True)
 
     async def fetch_chat_history(self):
         """Polls the Droplet API for the persistent chat log."""
@@ -282,6 +308,15 @@ class GemmaSupervisor:
             # Re-index every 5 loops
             if self.iteration > 0 and self.iteration % 5 == 0:
                 self.index_codebase()
+            
+            # Auto-Flush Ollama every 50 loops to clear RAM
+            if self.iteration > 0 and self.iteration % 50 == 0:
+                logger.info("Performing scheduled Memory Flush (Ollama restart)...")
+                await self.push_remote_log("Performing scheduled Memory Flush to stabilize RAM...")
+                subprocess.run(["pkill", "-9", "ollama"], capture_output=True)
+                subprocess.run(["pkill", "-9", "ollama serve"], capture_output=True)
+                subprocess.run(["open", "-a", "Ollama"], capture_output=True)
+                await asyncio.sleep(10) # Give it time to boot
                 
             log_str = f"--- Starting Iteration {self.iteration} ---"
             logger.info(log_str)
@@ -435,20 +470,23 @@ Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overar
                         code, out, err = await self.execute_native(cmd)
                         
                         # Truncate output to prevent blowing up the context window (Ollama limit/speed)
-                        if len(out) > 3000:
-                            out = "...[TRUNCATED]...\n" + out[-3000:]
-                        if len(err) > 1000:
-                            err = "...[TRUNCATED]...\n" + err[-1000:]
+                        if len(out) > 10000:
+                            out = "...[TRUNCATED]...\n" + out[-10000:]
+                        if len(err) > 2000:
+                            err = "...[TRUNCATED]...\n" + err[-2000:]
                             
                         res_msg = f"Native Result: {out}\n{err}"
-                        logger.info(res_msg[:500] + ("..." if len(res_msg) > 500 else ""))
-                        await self.push_remote_log(res_msg[:500] + ("..." if len(res_msg) > 500 else ""))
+                        if not out.strip() and not err.strip():
+                            res_msg = "Native Result: (Success - No output text produced)"
+                            
+                        logger.info(res_msg[:10000] + ("..." if len(res_msg) > 10000 else ""))
+                        await self.push_remote_log(res_msg[:10000] + ("..." if len(res_msg) > 10000 else ""))
                         
                         # Save last command output to DB
                         await self.push_agent_state("last_command_output", res_msg)
                         
                         # Add to cognitive history
-                        self.cognitive_history.append(f"Iteration {self.iteration}: Ran '{cmd}'. Result: {res_msg[:200]}...")
+                        self.cognitive_history.append(f"Iteration {self.iteration}: Ran '{cmd}'. Result: {res_msg[:10000]}...")
                         if len(self.cognitive_history) > 10: # Keep last 5 iterations (thought + result pairs)
                             self.cognitive_history.pop(0)
                         

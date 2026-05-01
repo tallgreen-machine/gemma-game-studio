@@ -127,7 +127,7 @@ class GemmaSupervisor:
             "prompt": prompt,
             "stream": False,
             "options": {
-                "num_ctx": 32768,
+                "num_ctx": 8192,
                 "num_predict": 4096,
                 "temperature": 0.7,
                 "top_p": 0.9,
@@ -136,7 +136,7 @@ class GemmaSupervisor:
         }
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.post(OLLAMA_URL, json=payload, timeout=300) as response:
+                async with session.post(OLLAMA_URL, json=payload, timeout=600) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get("response", "")
@@ -150,7 +150,7 @@ class GemmaSupervisor:
                     logger.warning("Potential Memory Lock detected. Flushing Ollama...")
                     subprocess.run(["pkill", "-9", "ollama"], capture_output=True)
                     subprocess.run(["pkill", "-9", "ollama serve"], capture_output=True)
-                    subprocess.run(["open", "-a", "Ollama"], capture_output=True)
+                    subprocess.Popen(["nohup", "ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setpgrp)
                 return ""
 
     def read_manifesto(self):
@@ -240,6 +240,23 @@ class GemmaSupervisor:
             pass
         return []
 
+    async def sync_intel(self):
+        """Syncs manifesto.md and journal.md to the Droplet for the dashboard."""
+        try:
+            intel = {
+                "manifesto": os.path.join(os.path.dirname(__file__), "manifesto.md"),
+                "journal": os.path.join(os.path.dirname(__file__), "game_workspace/journal.md")
+            }
+            async with aiohttp.ClientSession() as session:
+                headers = {"X-API-KEY": "epiphany_secret_2026"}
+                for name, path in intel.items():
+                    if os.path.exists(path):
+                        with open(path, 'r') as f:
+                            content = f.read()
+                        await session.post(f"http://{DROPLET_IP}:8080/api/{name}", json={"content": content}, headers=headers, timeout=5)
+        except Exception:
+            pass
+
     async def push_agent_state(self, key: str, value: str):
         try:
             async with aiohttp.ClientSession() as session:
@@ -285,10 +302,9 @@ class GemmaSupervisor:
             # 1. Fetch DB State
             state = await self.fetch_agent_state()
             
-            # Initialize iteration from DB on first boot, then increment manually
+            # Initialize iteration from DB on first boot
             if self.iteration == 0:
                 self.iteration = int(state.get("iteration_count", 0))
-            self.iteration += 1
             
             self.failures = int(state.get("consecutive_failures", self.failures))
             current_task = state.get("current_task", "None defined.")
@@ -305,6 +321,9 @@ class GemmaSupervisor:
             git_status_cmd = subprocess.run(["git", "status", "-s"], cwd=WORKSPACE_DIR, capture_output=True, text=True)
             git_status = git_status_cmd.stdout.strip() or "Clean working tree."
             
+            # Sync intel to dashboard
+            await self.sync_intel()
+            
             # Re-index every 5 loops
             if self.iteration > 0 and self.iteration % 5 == 0:
                 self.index_codebase()
@@ -315,7 +334,7 @@ class GemmaSupervisor:
                 await self.push_remote_log("Performing scheduled Memory Flush to stabilize RAM...")
                 subprocess.run(["pkill", "-9", "ollama"], capture_output=True)
                 subprocess.run(["pkill", "-9", "ollama serve"], capture_output=True)
-                subprocess.run(["open", "-a", "Ollama"], capture_output=True)
+                subprocess.Popen(["nohup", "ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setpgrp)
                 await asyncio.sleep(10) # Give it time to boot
                 
             log_str = f"--- Starting Iteration {self.iteration} ---"
@@ -370,7 +389,10 @@ Git Status:
 {loop_warning}
 
 You are in iteration {self.iteration}. Think step-by-step, then output a JSON object with your next action. 
-Available tools: run_bash, chat_respond, update_state, add_reminder, capture_screenshot, search_codebase.
+Available tools: run_bash, create_file, read_file, chat_respond, update_state, add_reminder, capture_screenshot, search_codebase, search_web.
+Example (Command): {{"thought": "list files", "tool": "run_bash", "command": "ls -R"}}
+Example (Create File): {{"thought": "write script", "tool": "create_file", "filename": "test.py", "content": "print('hello')"}}
+Example (Read File): {{"thought": "read script", "tool": "read_file", "filename": "test.py"}}
 Example (Command): {{"thought": "list files", "tool": "run_bash", "command": "ls -R"}}
 Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overarching_goal": "Build MMO", "current_task": "Audit files"}}
 """
@@ -383,14 +405,27 @@ Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overar
             await self.push_remote_log(f"Gemma 4 Output:\n{response}")
             logger.info(f"Gemma 4 Output:\n{response}")
             
+            if not response or len(response.strip()) < 10:
+                logger.warning("Empty or too-short response from Gemma. Nudging...")
+                await self.push_remote_log("Empty response detected. Re-prompting...")
+                await asyncio.sleep(2)
+                continue # Try the iteration again without incrementing failure
+                
             # Basic JSON parsing and tool execution
             try:
                 json_start = response.find("{")
                 json_end = response.rfind("}") + 1
                 if json_start != -1 and json_end != 0:
                     action = json.loads(response[json_start:json_end])
+                    # Fallback support for hallucination patterns
+                    if "tool" not in action and "action" in action:
+                        if action["action"] in ["create_file", "write_file"]:
+                            action["tool"] = "create_file"
+                            
                     tool = action.get("tool")
-                    
+                    if tool == "write_file":
+                        tool = "create_file"
+                        
                     if tool:
                         # Save thought to DB for next iteration
                         thought = action.get("thought", "")
@@ -461,6 +496,17 @@ Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overar
                         except Exception as e:
                             await self.push_remote_log(f"Search failed: {str(e)}")
                             
+                    elif tool == "search_web":
+                        query = action.get("query", "")
+                        logger.info(f"Web Search: {query}")
+                        await self.push_remote_log(f"Searching the web for: {query}")
+                        try:
+                            results = self.search_web(query)
+                            await self.push_agent_state("last_search_result", results)
+                            await self.push_remote_log("Web search complete. Results added to next prompt.")
+                        except Exception as e:
+                            await self.push_remote_log(f"Web search failed: {str(e)}")
+                            
                     elif tool == "run_bash":
                         cmd = action.get("command", "")
                         msg = f"Executing Natively: {cmd}"
@@ -482,32 +528,75 @@ Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overar
                         logger.info(res_msg[:10000] + ("..." if len(res_msg) > 10000 else ""))
                         await self.push_remote_log(res_msg[:10000] + ("..." if len(res_msg) > 10000 else ""))
                         
-                        # Save last command output to DB
-                        await self.push_agent_state("last_command_output", res_msg)
+                    elif tool == "create_file":
+                        filename = action.get("filename", "")
+                        content = action.get("content", "")
+                        msg = f"Creating file: {filename}"
+                        logger.info(msg)
+                        await self.push_remote_log(msg)
                         
-                        # Add to cognitive history
-                        self.cognitive_history.append(f"Iteration {self.iteration}: Ran '{cmd}'. Result: {res_msg[:10000]}...")
-                        if len(self.cognitive_history) > 10: # Keep last 5 iterations (thought + result pairs)
-                            self.cognitive_history.pop(0)
-                        
-                        if code != 0:
-                            self.failures += 1
-                            await self.push_agent_state("consecutive_failures", str(self.failures))
-                            if self.failures >= MAX_FAILURES:
-                                self.git_reset()
-                                self.append_journal("Executed Git Reset due to 5 consecutive failures.")
-                                self.failures = 0
-                                await self.push_agent_state("consecutive_failures", "0")
-                        else:
+                        try:
+                            # Create directories if they don't exist
+                            full_path = os.path.join(WORKSPACE_DIR, filename)
+                            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                            with open(full_path, 'w') as f:
+                                f.write(content)
+                            
+                            res_msg = f"Successfully created {filename}"
+                            await self.push_agent_state("last_cmd", res_msg)
+                            await self.push_remote_log(res_msg)
                             self.failures = 0
                             await self.push_agent_state("consecutive_failures", "0")
+                            
+                            # Add to cognitive history
+                            self.cognitive_history.append(f"Iteration {self.iteration}: Created '{filename}'. Result: Success.")
+                            if len(self.cognitive_history) > 10:
+                                self.cognitive_history.pop(0)
+                        except Exception as e:
+                            res_msg = f"Failed to create file: {str(e)}"
+                            await self.push_agent_state("last_cmd", res_msg)
+                            await self.push_remote_log(res_msg)
+                            self.failures += 1
+                            await self.push_agent_state("consecutive_failures", str(self.failures))
+                            
+                    elif tool == "read_file":
+                        filename = action.get("filename", "")
+                        msg = f"Reading file: {filename}"
+                        logger.info(msg)
+                        await self.push_remote_log(msg)
+                        
+                        try:
+                            full_path = os.path.join(WORKSPACE_DIR, filename)
+                            with open(full_path, 'r') as f:
+                                content = f.read()
+                            
+                            # Truncate if insanely large, though we have a 300-line mandate
+                            if len(content) > 15000:
+                                content = content[:15000] + "\n...[TRUNCATED]..."
+                                
+                            res_msg = f"File Contents of {filename}:\n{content}"
+                            await self.push_agent_state("last_cmd", res_msg)
+                            await self.push_remote_log(f"Successfully read {filename}")
+                            self.failures = 0
+                            await self.push_agent_state("consecutive_failures", "0")
+                            
+                            self.cognitive_history.append(f"Iteration {self.iteration}: Read '{filename}'.")
+                            if len(self.cognitive_history) > 10:
+                                self.cognitive_history.pop(0)
+                        except Exception as e:
+                            res_msg = f"Failed to read file: {str(e)}"
+                            await self.push_agent_state("last_cmd", res_msg)
+                            await self.push_remote_log(res_msg)
+                            self.failures += 1
+                            await self.push_agent_state("consecutive_failures", str(self.failures))
+                            
                     else:
                         err_msg = f"JSON Parser Error: Invalid or missing 'tool' key. You must use 'tool': 'run_bash' and 'command': '<your command>'. You provided: {response[json_start:json_end]}"
                         logger.warning(err_msg)
                         await self.push_remote_log(err_msg)
                         await self.push_agent_state("last_command_output", err_msg)
                 else:
-                    err_msg = "JSON Parser Error: No JSON object found in your output. You must output raw JSON."
+                    err_msg = "CRITICAL ERROR: No JSON object found in your output. You MUST wrap your tool calls in a valid JSON object like { \"thought\": \"...\", \"tool\": \"...\", ... }. Do not just talk; you must ACT."
                     logger.warning(err_msg)
                     await self.push_remote_log(err_msg)
                     await self.push_agent_state("last_command_output", err_msg)
@@ -526,6 +615,10 @@ Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overar
                     self.action_history.pop(0)
             except:
                 pass
+            
+            # Success! Increment and save
+            self.iteration += 1
+            await self.push_agent_state("iteration_count", str(self.iteration))
             
             await asyncio.sleep(5) # Prevent ultra-fast looping in case of API failure
 

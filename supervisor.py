@@ -168,16 +168,14 @@ class GemmaSupervisor:
             f.write(f"\n## Iteration {self.iteration}\n{entry}\n")
 
     def git_commit(self, message: str):
-        root_dir = os.path.dirname(__file__)
-        subprocess.run(["git", "add", "."], cwd=root_dir, capture_output=True)
-        subprocess.run(["git", "commit", "-m", message], cwd=root_dir, capture_output=True)
-        subprocess.run(["git", "push", "origin", "main"], cwd=root_dir, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run(["git", "commit", "-m", message], cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=WORKSPACE_DIR, capture_output=True)
         
     def git_reset(self):
-        root_dir = os.path.dirname(__file__)
         logger.warning("Executing 5-fail Git Reset...")
-        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=root_dir, capture_output=True)
-        subprocess.run(["git", "clean", "-fd"], cwd=root_dir, capture_output=True)
+        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run(["git", "clean", "-fd"], cwd=WORKSPACE_DIR, capture_output=True)
 
     async def fetch_chat_history(self):
         """Polls the Droplet API for the persistent chat log."""
@@ -357,7 +355,7 @@ class GemmaSupervisor:
                 with open(FEEDBACK_PATH, "r") as f:
                     content = f.read().strip()
                 if content and not content.startswith("<!-- Write your feedback"):
-                    human_feedback_str = f"[NEW MESSAGE FROM HUMAN]\n{content}\n"
+                    human_feedback_str = f"[NEW MESSAGE FROM HUMAN]\n{content}\n[MANDATORY]: You MUST respond to this message using the 'chat_respond' tool THIS iteration before doing anything else. Do not run tests, write code, or take any other action first.\n"
                     # Clear it after reading
                     with open(FEEDBACK_PATH, "w") as f:
                         f.write("<!-- Write your feedback or ideas here. The agent will read this on the next loop and then clear the file. -->\n")
@@ -461,6 +459,10 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                     if "tool" not in action and "action" in action:
                         if action["action"] in ["create_file", "write_file"]:
                             action["tool"] = "create_file"
+                        elif action["action"] in ["chat", "chat_respond"]:
+                            action["tool"] = "chat_respond"
+                            if "text" in action and "message" not in action:
+                                action["message"] = action["text"]
                             
                     tool = action.get("tool")
                     if tool == "write_file":
@@ -474,7 +476,7 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                             self.cognitive_history.append(f"Iteration {self.iteration} Thought: {thought}")
 
                     if tool == "chat_respond":
-                        msg = action.get("message", "")
+                        msg = action.get("message", action.get("content", action.get("text", "")))
                         logger.info(f"Agent Chat: {msg}")
                         await self.push_remote_chat(msg)
                         
@@ -507,13 +509,43 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                     elif tool == "capture_screenshot":
                         logger.info("Capturing screenshot via Playwright...")
                         await self.push_remote_log("Capturing screenshot via Playwright...")
-                        code, out, err = await self.execute_native("node capture_screenshot.js")
-                        if code == 0:
-                            screenshot_path = os.path.join(WORKSPACE_DIR, "latest_screenshot.png")
-                            await self.push_screenshot(screenshot_path)
-                            await self.push_remote_log("Screenshot uploaded to Dashboard.")
-                        else:
-                            await self.push_remote_log(f"Screenshot failed: {err}")
+                        # Start Vite dev server temporarily, wait for it to be ready, then screenshot
+                        import subprocess as _sp, signal as _sig, time as _time
+                        vite_proc = None
+                        screenshot_success = False
+                        try:
+                            vite_proc = _sp.Popen(
+                                ["npx", "vite", "--port", "5173"],
+                                cwd=WORKSPACE_DIR,
+                                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                                preexec_fn=os.setsid
+                            )
+                            # Wait up to 10s for Vite to be ready
+                            import socket as _sock
+                            for _ in range(20):
+                                _time.sleep(0.5)
+                                try:
+                                    s = _sock.create_connection(("localhost", 5173), timeout=1)
+                                    s.close()
+                                    break
+                                except OSError:
+                                    pass
+                            code, out, err = await self.execute_native("node capture_screenshot.js")
+                            if code == 0:
+                                screenshot_path = os.path.join(WORKSPACE_DIR, "latest_screenshot.png")
+                                await self.push_screenshot(screenshot_path)
+                                await self.push_remote_log("Screenshot uploaded to Dashboard.")
+                                screenshot_success = True
+                            else:
+                                await self.push_remote_log(f"Screenshot failed: {err}")
+                        except Exception as e:
+                            await self.push_remote_log(f"Screenshot error: {e}")
+                        finally:
+                            if vite_proc is not None:
+                                try:
+                                    os.killpg(os.getpgid(vite_proc.pid), _sig.SIGTERM)
+                                except Exception:
+                                    pass
                             
                     elif tool == "search_codebase":
                         query = action.get("query", "")

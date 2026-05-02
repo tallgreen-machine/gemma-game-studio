@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gemma 4 Epiphany Dashboard</title>
+    <title>NULL-SPACE: Epiphany Dashboard</title>
     <style>
         :root {
             --bg-color: #0d0d12;
@@ -21,10 +21,13 @@
             background-color: var(--bg-color);
             color: var(--text-main);
             font-family: 'Inter', -apple-system, sans-serif;
-            display: flex;
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            grid-template-rows: 1fr 180px;
             height: 100vh;
             box-sizing: border-box;
             gap: 20px;
+            overflow: hidden; /* Prevents whole window from scrolling */
         }
 
         .panel {
@@ -35,11 +38,13 @@
             display: flex;
             flex-direction: column;
             box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            overflow: hidden;
         }
 
         /* Logs Panel */
         #logs-panel {
-            flex: 2;
+            grid-column: 1;
+            grid-row: 1;
         }
 
         #terminal {
@@ -62,7 +67,8 @@
 
         /* Chat Panel */
         #chat-panel {
-            flex: 1;
+            grid-column: 2;
+            grid-row: 1;
         }
 
         #chat-history {
@@ -97,15 +103,21 @@
             border-bottom-left-radius: 2px;
         }
 
-        /* Media Gallery */
+        /* Media Panel */
+        #media-panel {
+            grid-column: 1 / span 2;
+            grid-row: 2;
+            display: flex;
+            flex-direction: column;
+            padding: 10px 20px;
+        }
+
         #media-gallery {
             display: flex;
-            gap: 10px;
+            gap: 15px;
             overflow-x: auto;
-            padding-bottom: 10px;
-            margin-bottom: 10px;
-            min-height: 120px;
-            border-bottom: 1px solid var(--border);
+            flex: 1;
+            align-items: center;
         }
 
         .media-item {
@@ -116,10 +128,11 @@
             transition: transform 0.2s, border-color 0.2s;
         }
 
-        .media-item:hover {
-            transform: scale(1.05);
-            border-color: var(--accent);
-        }
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
 
         .chat-input-container {
             display: flex;
@@ -262,13 +275,25 @@
     </div>
 
     <div class="panel" id="chat-panel">
-        <h2>Agent Communications</h2>
+        <div class="header-row">
+            <h2>Agent Communications</h2>
+            <button id="clear-btn" style="padding: 5px 12px; font-size: 12px; background: transparent; border: 1px solid #ff5555; color: #ff5555;">CLEAR HISTORY</button>
+        </div>
         <div id="chat-history">
             <div class="msg msg-agent">Gemma 4 is online. Epiphany Link established.</div>
         </div>
+        <div class="chat-input-container">
+            <input type="text" id="chat-input" placeholder="Give an instruction..." autocomplete="off">
+            <button id="send-btn">SEND</button>
+        </div>
+    </div>
+
+    <div class="panel" id="media-panel">
+        <h2>Observation Deck (Screenshots)</h2>
         <div id="media-gallery">
             <!-- Screenshots appear here -->
         </div>
+    </div>
 
     <!-- Modal -->
     <div id="intel-modal" class="modal">
@@ -283,10 +308,6 @@
             <div class="modal-body" id="modal-text">Loading...</div>
         </div>
     </div>
-        <div class="chat-input-container">
-            <input type="text" id="chat-input" placeholder="Give an instruction or pivot command..." autocomplete="off">
-            <button id="send-btn">SEND</button>
-        </div>
     </div>
 
     <script>
@@ -295,6 +316,7 @@
         const mediaGallery = document.getElementById('media-gallery');
         const chatInput = document.getElementById('chat-input');
         const sendBtn = document.getElementById('send-btn');
+        const clearBtn = document.getElementById('clear-btn');
 
         // Connect WebSocket
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -398,6 +420,23 @@
         chatInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') sendMessage();
         });
+
+        clearBtn.onclick = async () => {
+            if (!confirm("Clear all chat history? This will also reset Gemma's current context.")) return;
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+                const res = await fetch(`${protocol}//${window.location.host}/api/chat/history`, {
+                    method: 'DELETE',
+                    headers: {"X-API-KEY": "epiphany_secret_2026"}
+                });
+                if (res.ok) {
+                    chatHistory.innerHTML = '';
+                    appendMessage("Conversation cleared. Context reset.", "msg-agent");
+                }
+            } catch (err) {
+                console.error("Failed to clear history:", err);
+            }
+        }
 
         // Modal Logic
         const modal = document.getElementById('intel-modal');

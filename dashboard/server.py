@@ -110,6 +110,13 @@ async def api_get_chat_history(request):
         history = [{"sender": r['sender'], "message": r['message']} for r in records]
     return web.json_response({"history": history})
 
+async def api_clear_chat_history(request):
+    """Deletes all chat history."""
+    if not db_pool: return web.json_response({"error": "No DB"}, status=500)
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM chat_history")
+    return web.json_response({"status": "ok"})
+
 import os
 import time
 
@@ -180,6 +187,17 @@ async def api_add_reminder(request):
         await conn.execute("INSERT INTO reminders (note) VALUES ($1)", note)
     return web.json_response({"status": "ok"})
 
+async def api_get_journal(request):
+    """Serve the content of journal.md from the workspace."""
+    try:
+        journal_path = 'journal.md'
+        if os.path.exists(journal_path):
+            with open(journal_path, 'r') as f:
+                return web.json_response({"content": f.read()})
+        return web.json_response({"content": "Journal not found."}, status=404)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
 async def api_get_manifesto(request):
     """Serve the content of manifesto.md."""
     try:
@@ -190,16 +208,21 @@ async def api_get_manifesto(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-async def api_get_journal(request):
-    """Serve the content of journal.md from the workspace."""
-    try:
-        journal_path = 'game_workspace/journal.md'
-        if os.path.exists(journal_path):
-            with open(journal_path, 'r') as f:
-                return web.json_response({"content": f.read()})
-        return web.json_response({"content": "Journal not found."}, status=404)
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+async def api_update_journal(request):
+    """Update the content of journal.md on the server."""
+    data = await request.json()
+    content = data.get("content", "")
+    with open('journal.md', 'w') as f:
+        f.write(content)
+    return web.json_response({"status": "ok"})
+
+async def api_update_manifesto(request):
+    """Update the content of manifesto.md on the server."""
+    data = await request.json()
+    content = data.get("content", "")
+    with open('manifesto.md', 'w') as f:
+        f.write(content)
+    return web.json_response({"status": "ok"})
 
 app = web.Application(middlewares=[api_auth_middleware])
 app.on_startup.append(init_db)
@@ -211,6 +234,7 @@ app.add_routes([
     web.post('/api/logs', api_push_log),
     web.get('/api/chat/pending', api_get_pending_chat),
     web.get('/api/chat/history', api_get_chat_history),
+    web.delete('/api/chat/history', api_clear_chat_history),
     web.post('/api/chat/response', api_push_chat_response),
     web.post('/api/screenshot', api_push_screenshot),
     web.get('/api/state', api_get_state),
@@ -218,7 +242,9 @@ app.add_routes([
     web.get('/api/reminders', api_get_reminders),
     web.post('/api/reminders', api_add_reminder),
     web.get('/api/manifesto', api_get_manifesto),
+    web.post('/api/manifesto', api_update_manifesto),
     web.get('/api/journal', api_get_journal),
+    web.post('/api/journal', api_update_journal),
     web.static('/media', 'media')
 ])
 

@@ -68,7 +68,8 @@ class GemmaSupervisor:
             command,
             cwd=WORKSPACE_DIR,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            preexec_fn=os.setsid
         )
         
         try:
@@ -76,7 +77,10 @@ class GemmaSupervisor:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
             return process.returncode, stdout.decode(), stderr.decode()
         except asyncio.TimeoutError:
-            process.kill()
+            try:
+                os.killpg(os.getpgid(process.pid), 9)
+            except Exception:
+                process.kill()
             return 1, "", "Command timed out after 60 seconds. Do NOT run interactive or watching commands."
 
     def search_web(self, query: str, max_results=3):
@@ -347,6 +351,17 @@ class GemmaSupervisor:
             # Fetch persistent chat history
             chat_history_str = await self.fetch_chat_history()
             
+            # Formulate human feedback
+            human_feedback_str = ""
+            if os.path.exists(FEEDBACK_PATH):
+                with open(FEEDBACK_PATH, "r") as f:
+                    content = f.read().strip()
+                if content and not content.startswith("<!-- Write your feedback"):
+                    human_feedback_str = f"[NEW MESSAGE FROM HUMAN]\n{content}\n"
+                    # Clear it after reading
+                    with open(FEEDBACK_PATH, "w") as f:
+                        f.write("<!-- Write your feedback or ideas here. The agent will read this on the next loop and then clear the file. -->\n")
+            
             # Format cognitive history
             cognitive_history_str = "\n".join(self.cognitive_history) if self.cognitive_history else "No history yet."
             
@@ -355,7 +370,16 @@ class GemmaSupervisor:
             if len(self.action_history) >= 3:
                 last_3 = self.action_history[-3:]
                 if all(a == last_3[0] for a in last_3):
-                    loop_warning = f"\n\n[CRITICAL LOOP DETECTED]\nYou have performed the action '{last_3[0]}' three times in a row. YOU ARE STUCK. Do NOT repeat this action. You must pivot your strategy, search the web, or audit a different part of the codebase to break the loop."
+                    loop_warning += f"\n\n[CRITICAL LOOP DETECTED]\nYou have performed the exact same action '{last_3[0]}' three times in a row and are failing. YOU ARE STUCK. Do NOT repeat this exact action. Instead of abandoning the task, gather new context to diagnose WHY it is failing. For example, use `run_bash` to run `ls -la` and check if your file paths are correct, use `read_file` to verify syntax, or use `search_web`. Identify the root cause and fix it before trying again."
+                
+                # Semantic Loop Detection for Exploration Paralysis
+                tools_used = [a.split(":")[0] if ":" in a else a for a in self.action_history]
+                read_only_tools = {"run_bash", "read_file", "search_codebase", "search_web"}
+                
+                if len(tools_used) >= 4 and all(t in read_only_tools for t in tools_used[-4:]):
+                    cmd_history = " ".join(self.action_history[-4:])
+                    if ("ls" in cmd_history or "find" in cmd_history or "grep" in cmd_history or "cat" in cmd_history):
+                        loop_warning += "\n\n[EXPLORATION PARALYSIS DETECTED]\nYou are repeatedly listing files, searching, or exploring the filesystem without making modifications. STOP EXPLORING. You must formulate a fix, write the code, and use 'create_file' to submit your progress immediately."
             
             # Construct context window
             system_prompt = f"""System:
@@ -381,6 +405,7 @@ Git Status:
 [CHAT HISTORY (Last 10 Messages)]
 {chat_history_str}
 
+{human_feedback_str}
 [LAST THOUGHT]
 {last_thought}
 
@@ -388,13 +413,28 @@ Git Status:
 {cognitive_history_str}
 {loop_warning}
 
-You are in iteration {self.iteration}. Think step-by-step, then output a JSON object with your next action. 
+You are in iteration {self.iteration}. Think step-by-step, then output a JSON object with your next action.
+
+[ACTION MANDATE]: Stop over-analyzing. If you have read a specification or file once, DO NOT read it again. Trust your memory and take action. Bias heavily towards creating files, writing code, and running tests rather than endless reading.
+"""
+            # Procedural Triggers (Injected at the end so it's fresh in its attention window)
+            if self.iteration > 0 and self.iteration % 20 == 0:
+                system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: This is a milestone iteration (#" + str(self.iteration) + "). You MUST use the `create_file` or `run_bash` tool to update `journal.md` with your current progress and next steps before doing anything else.\n"
+            
+            if "vitest" in last_cmd.lower() and "failed | 0 passed" not in last_cmd.lower() and "fail " not in last_cmd.lower():
+                system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: It looks like you just had a successful test run! Consider using `capture_screenshot` to verify visuals, or `run_bash` to back up your changes with `git commit`.\n"
+
+            system_prompt += """
+[SECURITY BOUNDARY]: 
+1. Run commands natively. CWD is the root of the workspace. Do NOT `cd` around.
+2. ALL commands must be non-interactive (e.g. `CI=true npm test`). Never run a watch script.
+3. NEVER attempt to edit `supervisor.py`. ONLY edit workspace files.
+
 Available tools: run_bash, create_file, read_file, chat_respond, update_state, add_reminder, capture_screenshot, search_codebase, search_web.
-Example (Command): {{"thought": "list files", "tool": "run_bash", "command": "ls -R"}}
-Example (Create File): {{"thought": "write script", "tool": "create_file", "filename": "test.py", "content": "print('hello')"}}
-Example (Read File): {{"thought": "read script", "tool": "read_file", "filename": "test.py"}}
-Example (Command): {{"thought": "list files", "tool": "run_bash", "command": "ls -R"}}
-Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overarching_goal": "Build MMO", "current_task": "Audit files"}}
+Example (Command): {"thought": "list files", "tool": "run_bash", "command": "ls -R"}
+Example (Create File): {"thought": "write script", "tool": "create_file", "filename": "test.py", "content": "print('hello')"}
+Example (Read File): {"thought": "read script", "tool": "read_file", "filename": "test.py"}
+Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarching_goal": "Build MMO", "current_task": "Audit files"}
 """
             
             # Request action from Gemma
@@ -528,6 +568,16 @@ Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overar
                         logger.info(res_msg[:10000] + ("..." if len(res_msg) > 10000 else ""))
                         await self.push_remote_log(res_msg[:10000] + ("..." if len(res_msg) > 10000 else ""))
                         
+                        # FIX: Actually save the output so the agent can see it next loop
+                        await self.push_agent_state("last_command_output", res_msg)
+                        self.failures = 0
+                        await self.push_agent_state("consecutive_failures", "0")
+                        
+                        short_cmd = cmd[:30] + ("..." if len(cmd) > 30 else "")
+                        self.cognitive_history.append(f"Iteration {self.iteration}: Ran '{short_cmd}'")
+                        if len(self.cognitive_history) > 10:
+                            self.cognitive_history.pop(0)
+                        
                     elif tool == "create_file":
                         filename = action.get("filename", "")
                         content = action.get("content", "")
@@ -543,7 +593,7 @@ Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overar
                                 f.write(content)
                             
                             res_msg = f"Successfully created {filename}"
-                            await self.push_agent_state("last_cmd", res_msg)
+                            await self.push_agent_state("last_command_output", res_msg)
                             await self.push_remote_log(res_msg)
                             self.failures = 0
                             await self.push_agent_state("consecutive_failures", "0")
@@ -554,7 +604,7 @@ Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overar
                                 self.cognitive_history.pop(0)
                         except Exception as e:
                             res_msg = f"Failed to create file: {str(e)}"
-                            await self.push_agent_state("last_cmd", res_msg)
+                            await self.push_agent_state("last_command_output", res_msg)
                             await self.push_remote_log(res_msg)
                             self.failures += 1
                             await self.push_agent_state("consecutive_failures", str(self.failures))
@@ -575,7 +625,7 @@ Example (Goal): {{"thought": "Set initial goal", "tool": "update_state", "overar
                                 content = content[:15000] + "\n...[TRUNCATED]..."
                                 
                             res_msg = f"File Contents of {filename}:\n{content}"
-                            await self.push_agent_state("last_cmd", res_msg)
+                            await self.push_agent_state("last_command_output", res_msg)
                             await self.push_remote_log(f"Successfully read {filename}")
                             self.failures = 0
                             await self.push_agent_state("consecutive_failures", "0")

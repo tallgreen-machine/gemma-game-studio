@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NULL-SPACE: Epiphany Dashboard</title>
+    <title>Gemma Game Studio — Aetheria</title>
     <style>
         :root {
             --bg-color: #0d0d12;
@@ -14,288 +14,133 @@
             --accent-glow: rgba(0, 255, 204, 0.2);
             --border: #2a2a35;
         }
+        * { box-sizing: border-box; }
+        body { margin: 0; background-color: var(--bg-color); color: var(--text-main); font-family: 'Inter', -apple-system, sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
 
-        body {
-            margin: 0;
-            padding: 20px;
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            font-family: 'Inter', -apple-system, sans-serif;
-            display: grid;
-            grid-template-columns: 2fr 1fr;
-            grid-template-rows: 1fr 180px;
-            height: 100vh;
-            box-sizing: border-box;
-            gap: 20px;
-            overflow: hidden; /* Prevents whole window from scrolling */
-        }
+        /* Top nav */
+        #top-nav { display: flex; align-items: center; padding: 0 20px; background: var(--panel-bg); border-bottom: 1px solid var(--border); height: 48px; flex-shrink: 0; }
+        #top-nav .brand { font-size: 13px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: var(--accent); margin-right: 30px; }
+        .nav-tab { height: 48px; padding: 0 20px; background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--text-dim); font-size: 13px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; cursor: pointer; transition: color 0.2s, border-color 0.2s; }
+        .nav-tab:hover { color: var(--text-main); }
+        .nav-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+        .nav-spacer { flex: 1; }
 
-        .panel {
-            background-color: var(--panel-bg);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 20px;
-            display: flex;
-            flex-direction: column;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-            overflow: hidden;
-        }
+        /* Pages */
+        .page { display: none; flex: 1; overflow: hidden; }
+        .page.active { display: flex; }
 
-        /* Logs Panel */
-        #logs-panel {
-            grid-column: 1;
-            grid-row: 1;
-        }
-
-        #terminal {
-            flex: 1;
-            background-color: #000;
-            border-radius: 8px;
-            padding: 15px;
-            font-family: 'Fira Code', monospace;
-            font-size: 13px;
-            color: #50fa7b; /* Dracul-style green */
-            overflow-y: auto;
-            white-space: pre-wrap;
-            box-shadow: inset 0 0 10px rgba(0,255,0,0.05);
-        }
-
-        .log-header { color: #bd93f9; font-weight: bold; display: block; margin-top: 15px; margin-bottom: 5px; font-size: 14px; border-bottom: 1px solid rgba(189, 147, 249, 0.3); }
+        /* Mission Control */
+        #page-mission { padding: 20px; gap: 20px; }
+        .panel { background-color: var(--panel-bg); border: 1px solid var(--border); border-radius: 12px; padding: 20px; display: flex; flex-direction: column; box-shadow: 0 4px 20px rgba(0,0,0,0.5); overflow: hidden; }
+        #logs-panel { flex: 2; }
+        #chat-panel { flex: 1; min-width: 300px; }
+        #terminal { flex: 1; background-color: #000; border-radius: 8px; padding: 15px; font-family: 'Fira Code', monospace; font-size: 13px; color: #50fa7b; overflow-y: auto; white-space: pre-wrap; }
+        .log-header { color: #bd93f9; font-weight: bold; display: block; margin-top: 15px; margin-bottom: 5px; font-size: 14px; border-bottom: 1px solid rgba(189,147,249,0.3); }
         .log-cmd { color: #f1fa8c; }
         .log-err { color: #ff5555; font-weight: bold; }
         .log-info { color: #8be9fd; }
+        #chat-history { flex: 1; overflow-y: auto; margin-bottom: 15px; padding-right: 10px; display: flex; flex-direction: column; gap: 10px; }
+        .msg { padding: 10px 14px; border-radius: 8px; max-width: 85%; font-size: 14px; line-height: 1.4; }
+        .msg-human { background-color: #2b2b36; align-self: flex-end; border-bottom-right-radius: 2px; }
+        .msg-agent { background-color: var(--accent-glow); border: 1px solid var(--accent); color: var(--accent); align-self: flex-start; border-bottom-left-radius: 2px; }
 
-        /* Chat Panel */
-        #chat-panel {
-            grid-column: 2;
-            grid-row: 1;
-        }
+        /* Observation Deck */
+        #page-obs { flex-direction: column; padding: 20px; gap: 16px; }
+        #obs-header { display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+        #obs-header h2 { margin: 0; font-size: 16px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); }
+        #live-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--accent); border: 1px solid var(--accent); border-radius: 20px; padding: 3px 10px; opacity: 0; transition: opacity 0.5s; }
+        #live-badge.visible { opacity: 1; }
+        #live-badge .dot { width: 7px; height: 7px; background: var(--accent); border-radius: 50%; animation: pulse 1.2s ease-in-out infinite; }
+        @keyframes pulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.4); opacity: 0.5; } }
+        #auto-advance-toggle { display: flex; align-items: center; gap: 8px; margin-left: auto; font-size: 12px; color: var(--text-dim); cursor: pointer; user-select: none; }
+        #auto-advance-toggle input { cursor: pointer; accent-color: var(--accent); width: 14px; height: 14px; }
+        #obs-featured { flex: 1; background: #000; border: 1px solid var(--border); border-radius: 12px; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; min-height: 0; }
+        #obs-featured img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px; }
+        #obs-featured .empty-state { color: var(--text-dim); font-size: 14px; text-align: center; }
+        #featured-meta { position: absolute; bottom: 12px; left: 12px; background: rgba(0,0,0,0.7); padding: 5px 10px; border-radius: 6px; font-size: 12px; color: var(--text-dim); backdrop-filter: blur(4px); }
+        #diff-badge { position: absolute; top: 12px; right: 12px; background: rgba(0,255,204,0.15); border: 1px solid var(--accent); color: var(--accent); padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 1px; display: none; }
+        #obs-timeline { flex-shrink: 0; height: 110px; background: var(--panel-bg); border: 1px solid var(--border); border-radius: 12px; display: flex; align-items: center; gap: 10px; padding: 10px 16px; overflow-x: auto; }
+        .thumb-wrap { position: relative; display: inline-flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0; }
+        .thumb { height: 80px; width: auto; border-radius: 6px; border: 2px solid var(--border); cursor: pointer; transition: border-color 0.2s, transform 0.15s; }
+        .thumb:hover { border-color: var(--text-dim); transform: scale(1.05); }
+        .thumb.selected { border-color: var(--accent); box-shadow: 0 0 10px var(--accent-glow); }
+        .thumb-ts { font-size: 10px; color: var(--text-dim); white-space: nowrap; }
 
-        #chat-history {
-            flex: 1;
-            overflow-y: auto;
-            margin-bottom: 15px;
-            padding-right: 10px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-
-        .msg {
-            padding: 10px 14px;
-            border-radius: 8px;
-            max-width: 85%;
-            font-size: 14px;
-            line-height: 1.4;
-        }
-
-        .msg-human {
-            background-color: #2b2b36;
-            align-self: flex-end;
-            border-bottom-right-radius: 2px;
-        }
-
-        .msg-agent {
-            background-color: var(--accent-glow);
-            border: 1px solid var(--accent);
-            color: var(--accent);
-            align-self: flex-start;
-            border-bottom-left-radius: 2px;
-        }
-
-        /* Media Panel */
-        #media-panel {
-            grid-column: 1 / span 2;
-            grid-row: 2;
-            display: flex;
-            flex-direction: column;
-            padding: 10px 20px;
-        }
-
-        #media-gallery {
-            display: flex;
-            gap: 15px;
-            overflow-x: auto;
-            flex: 1;
-            align-items: center;
-        }
-
-        .media-item {
-            height: 100px;
-            border-radius: 6px;
-            border: 1px solid var(--border);
-            cursor: pointer;
-            transition: transform 0.2s, border-color 0.2s;
-        }
-
-        /* Custom Scrollbar */
+        /* Shared */
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); }
         ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+        .chat-input-container { display: flex; gap: 10px; }
+        input[type=text] { flex: 1; padding: 12px; background-color: #000; border: 1px solid var(--border); border-radius: 6px; color: var(--text-main); outline: none; transition: border-color 0.2s; }
+        input[type=text]:focus { border-color: var(--accent); }
+        button { padding: 0 20px; background-color: var(--accent); color: #000; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; transition: transform 0.1s, box-shadow 0.2s; }
+        button:hover { box-shadow: 0 0 15px var(--accent-glow); }
+        button:active { transform: scale(0.98); }
+        h2 { margin: 0; font-size: 16px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); }
+        .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
 
-        .chat-input-container {
-            display: flex;
-            gap: 10px;
-        }
-
-        input {
-            flex: 1;
-            padding: 12px;
-            background-color: #000;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            color: var(--text-main);
-            outline: none;
-            transition: border-color 0.2s;
-        }
-
-        input:focus {
-            border-color: var(--accent);
-        }
-
-        button {
-            padding: 0 20px;
-            background-color: var(--accent);
-            color: #000;
-            border: none;
-            border-radius: 6px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: transform 0.1s, box-shadow 0.2s;
-        }
-
-        button:hover {
-            box-shadow: 0 0 15px var(--accent-glow);
-        }
-
-        button:active {
-            transform: scale(0.98);
-        }
-
-        h2 {
-            margin: 0;
-            font-size: 16px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: var(--text-dim);
-        }
-
-        .header-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-        }
-
-        /* Modal Styles */
-        .modal {
-            display: none;
-            position: fixed;
-            z-index: 1000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0,0,0,0.8);
-            backdrop-filter: blur(5px);
-        }
-
-        .modal-content {
-            background-color: var(--panel-bg);
-            margin: 5% auto;
-            padding: 30px;
-            border: 1px solid var(--accent);
-            width: 80%;
-            max-width: 900px;
-            height: 70vh;
-            border-radius: 15px;
-            display: flex;
-            flex-direction: column;
-            box-shadow: 0 0 30px var(--accent-glow);
-        }
-
-        .modal-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-
-        .modal-body {
-            flex: 1;
-            overflow-y: auto;
-            background: #000;
-            padding: 20px;
-            border-radius: 8px;
-            font-family: 'Inter', sans-serif;
-            white-space: pre-wrap;
-            line-height: 1.6;
-            color: #ccc;
-        }
-
-        .tab-btns {
-            display: flex;
-            gap: 10px;
-        }
-
-        .tab-btn {
-            padding: 8px 15px;
-            background: transparent;
-            border: 1px solid var(--border);
-            color: var(--text-dim);
-            cursor: pointer;
-            border-radius: 4px;
-        }
-
-        .tab-btn.active {
-            background: var(--accent-glow);
-            border-color: var(--accent);
-            color: var(--accent);
-        }
-
-        .close-btn {
-            color: var(--text-dim);
-            font-size: 28px;
-            cursor: pointer;
-        }
-
+        /* Modal */
+        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.8); backdrop-filter: blur(5px); }
+        .modal-content { background-color: var(--panel-bg); margin: 5% auto; padding: 30px; border: 1px solid var(--accent); width: 80%; max-width: 900px; height: 70vh; border-radius: 15px; display: flex; flex-direction: column; box-shadow: 0 0 30px var(--accent-glow); }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .modal-body { flex: 1; overflow-y: auto; background: #000; padding: 20px; border-radius: 8px; font-family: 'Inter', sans-serif; white-space: pre-wrap; line-height: 1.6; color: #ccc; }
+        .tab-btns { display: flex; gap: 10px; }
+        .tab-btn { padding: 8px 15px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); cursor: pointer; border-radius: 4px; }
+        .tab-btn.active { background: var(--accent-glow); border-color: var(--accent); color: var(--accent); }
+        .close-btn { color: var(--text-dim); font-size: 28px; cursor: pointer; }
         .close-btn:hover { color: #fff; }
     </style>
 </head>
 <body>
 
-    <div class="panel" id="logs-panel">
-        <div class="header-row">
-            <h2>Live Mac Supervisor Logs</h2>
-            <button id="intel-btn" style="padding: 5px 12px; font-size: 12px; background: transparent; border: 1px solid var(--accent); color: var(--accent);">PROJECT INTEL</button>
-        </div>
-        <div id="terminal">System Initialized. Waiting for connection...
+    <nav id="top-nav">
+        <span class="brand">Gemma Game Studio</span>
+        <button class="nav-tab active" data-page="page-mission">Mission Control</button>
+        <button class="nav-tab" data-page="page-obs">Observation Deck</button>
+        <div class="nav-spacer"></div>
+        <button id="intel-btn" style="padding:5px 12px;font-size:12px;background:transparent;border:1px solid var(--accent);color:var(--accent)">PROJECT INTEL</button>
+    </nav>
+
+    <!-- Mission Control -->
+    <div id="page-mission" class="page active" style="gap:20px;padding:20px">
+        <div class="panel" id="logs-panel">
+            <div class="header-row"><h2>Live Supervisor Logs</h2></div>
+            <div id="terminal">System Initialized. Waiting for connection...
 </div>
-    </div>
-
-    <div class="panel" id="chat-panel">
-        <div class="header-row">
-            <h2>Agent Communications</h2>
-            <button id="clear-btn" style="padding: 5px 12px; font-size: 12px; background: transparent; border: 1px solid #ff5555; color: #ff5555;">CLEAR HISTORY</button>
         </div>
-        <div id="chat-history">
-            <div class="msg msg-agent">Gemma 4 is online. Epiphany Link established.</div>
-        </div>
-        <div class="chat-input-container">
-            <input type="text" id="chat-input" placeholder="Give an instruction..." autocomplete="off">
-            <button id="send-btn">SEND</button>
-        </div>
-    </div>
-
-    <div class="panel" id="media-panel">
-        <h2>Observation Deck (Screenshots)</h2>
-        <div id="media-gallery">
-            <!-- Screenshots appear here -->
+        <div class="panel" id="chat-panel">
+            <div class="header-row">
+                <h2>Agent Communications</h2>
+                <button id="clear-btn" style="padding:5px 12px;font-size:12px;background:transparent;border:1px solid #ff5555;color:#ff5555">CLEAR</button>
+            </div>
+            <div id="chat-history">
+                <div class="msg msg-agent">Gemma 4 is online. Epiphany Link established.</div>
+            </div>
+            <div class="chat-input-container">
+                <input type="text" id="chat-input" placeholder="Give an instruction..." autocomplete="off">
+                <button id="send-btn">SEND</button>
+            </div>
         </div>
     </div>
 
-    <!-- Modal -->
+    <!-- Observation Deck -->
+    <div id="page-obs" class="page" style="flex-direction:column;padding:20px;gap:16px">
+        <div id="obs-header">
+            <h2>Observation Deck</h2>
+            <span id="live-badge"><span class="dot"></span>NEW SCREENSHOT</span>
+            <label id="auto-advance-toggle">
+                <input type="checkbox" id="auto-advance" checked>
+                Auto-advance to latest
+            </label>
+        </div>
+        <div id="obs-featured">
+            <div class="empty-state">No screenshots yet.<br>Gemma will capture when the game is ready.</div>
+        </div>
+        <div id="obs-timeline"></div>
+    </div>
+
+    <!-- Project Intel Modal -->
     <div id="intel-modal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
@@ -308,72 +153,119 @@
             <div class="modal-body" id="modal-text">Loading...</div>
         </div>
     </div>
-    </div>
 
     <script>
+        // Tab navigation
+        document.querySelectorAll('.nav-tab').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById(btn.dataset.page).classList.add('active');
+            });
+        });
+
         const terminal = document.getElementById('terminal');
         const chatHistory = document.getElementById('chat-history');
-        const mediaGallery = document.getElementById('media-gallery');
         const chatInput = document.getElementById('chat-input');
         const sendBtn = document.getElementById('send-btn');
         const clearBtn = document.getElementById('clear-btn');
+        const obsFeatured = document.getElementById('obs-featured');
+        const obsTimeline = document.getElementById('obs-timeline');
+        const liveBadge = document.getElementById('live-badge');
+        const autoAdvance = document.getElementById('auto-advance');
 
-        // Connect WebSocket
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws`;
-        
+        const screenshots = [];
+        let currentIteration = 0;
+
+        function formatTime(ts) {
+            return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+
+        function selectScreenshot(index) {
+            const shot = screenshots[index];
+            obsFeatured.innerHTML = '';
+            const img = document.createElement('img');
+            img.src = shot.url;
+            obsFeatured.appendChild(img);
+
+            const meta = document.createElement('div');
+            meta.id = 'featured-meta';
+            meta.textContent = formatTime(shot.timestamp) + '  |  Iteration ' + shot.iteration;
+            obsFeatured.appendChild(meta);
+
+            if (index > 0) {
+                const diff = shot.iteration - screenshots[index - 1].iteration;
+                if (diff > 0) {
+                    const badge = document.createElement('div');
+                    badge.id = 'diff-badge';
+                    badge.style.display = 'block';
+                    badge.textContent = '+' + diff + ' ITERATIONS';
+                    obsFeatured.appendChild(badge);
+                }
+            }
+
+            document.querySelectorAll('.thumb').forEach((t, i) => t.classList.toggle('selected', i === index));
+        }
+
+        function addScreenshot(url, iteration) {
+            const shot = { url, timestamp: Date.now(), iteration };
+            screenshots.push(shot);
+            const idx = screenshots.length - 1;
+
+            const wrap = document.createElement('div');
+            wrap.className = 'thumb-wrap';
+            const img = document.createElement('img');
+            img.src = url;
+            img.className = 'thumb';
+            img.addEventListener('click', () => selectScreenshot(idx));
+            const ts = document.createElement('span');
+            ts.className = 'thumb-ts';
+            ts.textContent = formatTime(shot.timestamp);
+            wrap.appendChild(img);
+            wrap.appendChild(ts);
+            obsTimeline.appendChild(wrap);
+            obsTimeline.scrollLeft = obsTimeline.scrollWidth;
+
+            liveBadge.classList.add('visible');
+            setTimeout(() => liveBadge.classList.remove('visible'), 3000);
+            if (autoAdvance.checked) selectScreenshot(idx);
+        }
+
+        // WebSocket
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         let ws;
         function connect() {
-            ws = new WebSocket(wsUrl);
+            ws = new WebSocket(wsProtocol + '//' + window.location.host + '/ws');
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
-                
                 if (data.type === 'log') {
+                    const m = data.text.match(/Starting Iteration (\d+)/);
+                    if (m) currentIteration = parseInt(m[1]);
                     const line = document.createElement('div');
                     const text = data.text;
-                    
-                    if (text.includes('--- Starting Iteration')) {
-                        line.className = 'log-header';
-                    } else if (text.startsWith('Executing Natively:')) {
-                        line.className = 'log-cmd';
-                    } else if (text.includes('ERROR') || text.includes('failed') || text.includes('Error')) {
-                        line.className = 'log-err';
-                    } else if (text.startsWith('Native Result:')) {
-                        line.className = 'log-info';
-                    } else if (text.startsWith('Querying Gemma 4')) {
-                        line.style.color = '#ffb86c'; // Orange
-                        line.style.fontStyle = 'italic';
-                    } else if (text.startsWith('Gemma 4 Output:')) {
-                        line.style.color = '#f8f8f2';
-                        line.style.borderLeft = '2px solid var(--accent)';
-                        line.style.paddingLeft = '10px';
-                        line.style.marginTop = '10px';
-                    }
-                    
+                    if (text.includes('--- Starting Iteration')) line.className = 'log-header';
+                    else if (text.startsWith('Executing Natively:')) line.className = 'log-cmd';
+                    else if (text.includes('ERROR') || text.includes('failed') || text.includes('Error')) line.className = 'log-err';
+                    else if (text.startsWith('Native Result:')) line.className = 'log-info';
+                    else if (text.startsWith('Querying Gemma 4')) { line.style.color = '#ffb86c'; line.style.fontStyle = 'italic'; }
+                    else if (text.startsWith('Gemma 4 Output:')) { line.style.color = '#f8f8f2'; line.style.borderLeft = '2px solid var(--accent)'; line.style.paddingLeft = '10px'; line.style.marginTop = '10px'; }
                     line.textContent = text;
                     terminal.appendChild(line);
                     terminal.scrollTop = terminal.scrollHeight;
                 } else if (data.type === 'agent_chat') {
                     appendMessage(data.text, 'msg-agent');
                 } else if (data.type === 'screenshot') {
-                    const img = document.createElement('img');
-                    img.src = data.url;
-                    img.className = 'media-item';
-                    img.onclick = () => window.open(data.url, '_blank');
-                    mediaGallery.appendChild(img);
-                    mediaGallery.scrollLeft = mediaGallery.scrollWidth;
+                    addScreenshot(data.url, currentIteration);
                 }
             };
-            
-            ws.onclose = () => {
-                setTimeout(connect, 2000);
-            };
+            ws.onclose = () => setTimeout(connect, 2000);
         }
         connect();
 
         function appendMessage(text, className) {
             const div = document.createElement('div');
-            div.className = `msg ${className}`;
+            div.className = 'msg ' + className;
             div.textContent = text;
             chatHistory.appendChild(div);
             chatHistory.scrollTop = chatHistory.scrollHeight;
@@ -381,104 +273,59 @@
 
         async function loadChatHistory() {
             try {
-                const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
-                const res = await fetch(`${protocol}//${window.location.host}/api/chat/history`, {
-                    headers: {"X-API-KEY": "epiphany_secret_2026"}
-                });
+                const base = window.location.protocol + '//' + window.location.host;
+                const res = await fetch(base + '/api/chat/history', { headers: { 'X-API-KEY': 'epiphany_secret_2026' } });
                 if (res.ok) {
                     const data = await res.json();
-                    chatHistory.innerHTML = ''; // Clear default message
-                    data.history.forEach(msg => {
-                        const className = msg.sender === 'human' ? 'msg-human' : 'msg-agent';
-                        appendMessage(msg.message, className);
-                    });
-                    if (data.history.length === 0) {
-                        appendMessage("Gemma 4 is online. Epiphany Link established.", "msg-agent");
-                    }
+                    chatHistory.innerHTML = '';
+                    data.history.forEach(msg => appendMessage(msg.message, msg.sender === 'human' ? 'msg-human' : 'msg-agent'));
+                    if (data.history.length === 0) appendMessage('Gemma 4 is online. Epiphany Link established.', 'msg-agent');
                 }
-            } catch (err) {
-                console.error("Failed to load chat history:", err);
-            }
+            } catch (err) { console.error('Failed to load chat history:', err); }
         }
         loadChatHistory();
 
         function sendMessage() {
             const text = chatInput.value.trim();
             if (!text) return;
-
             appendMessage(text, 'msg-human');
-            
-            // Send via WS to droplet queue
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'chat', text: text }));
-            }
-
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'chat', text }));
             chatInput.value = '';
         }
-
         sendBtn.addEventListener('click', sendMessage);
-        chatInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') sendMessage();
-        });
+        chatInput.addEventListener('keypress', e => { if (e.key === 'Enter') sendMessage(); });
 
         clearBtn.onclick = async () => {
             if (!confirm("Clear all chat history? This will also reset Gemma's current context.")) return;
             try {
-                const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
-                const res = await fetch(`${protocol}//${window.location.host}/api/chat/history`, {
-                    method: 'DELETE',
-                    headers: {"X-API-KEY": "epiphany_secret_2026"}
-                });
-                if (res.ok) {
-                    chatHistory.innerHTML = '';
-                    appendMessage("Conversation cleared. Context reset.", "msg-agent");
-                }
-            } catch (err) {
-                console.error("Failed to clear history:", err);
-            }
-        }
+                const base = window.location.protocol + '//' + window.location.host;
+                const res = await fetch(base + '/api/chat/history', { method: 'DELETE', headers: { 'X-API-KEY': 'epiphany_secret_2026' } });
+                if (res.ok) { chatHistory.innerHTML = ''; appendMessage('Conversation cleared. Context reset.', 'msg-agent'); }
+            } catch (err) { console.error('Failed to clear history:', err); }
+        };
 
-        // Modal Logic
+        // Intel Modal
         const modal = document.getElementById('intel-modal');
-        const intelBtn = document.getElementById('intel-btn');
-        const closeModal = document.getElementById('close-modal');
         const modalText = document.getElementById('modal-text');
         const tabManifesto = document.getElementById('tab-manifesto');
         const tabJournal = document.getElementById('tab-journal');
 
-        intelBtn.onclick = () => {
-            modal.style.display = "block";
-            fetchContent('/api/manifesto');
-        }
-
-        closeModal.onclick = () => modal.style.display = "none";
-        window.onclick = (event) => { if (event.target == modal) modal.style.display = "none"; }
+        document.getElementById('intel-btn').onclick = () => { modal.style.display = 'block'; fetchContent('/api/manifesto'); };
+        document.getElementById('close-modal').onclick = () => modal.style.display = 'none';
+        window.addEventListener('click', e => { if (e.target === modal) modal.style.display = 'none'; });
 
         async function fetchContent(url) {
-            modalText.textContent = "Loading...";
+            modalText.textContent = 'Loading...';
             try {
-                const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
-                const res = await fetch(`${protocol}//${window.location.host}${url}`, {
-                    headers: {"X-API-KEY": "epiphany_secret_2026"}
-                });
+                const base = window.location.protocol + '//' + window.location.host;
+                const res = await fetch(base + url, { headers: { 'X-API-KEY': 'epiphany_secret_2026' } });
                 const data = await res.json();
-                modalText.textContent = data.content || "No content found.";
-            } catch (err) {
-                modalText.textContent = "Error loading content.";
-            }
+                modalText.textContent = data.content || 'No content found.';
+            } catch (err) { modalText.textContent = 'Error loading content.'; }
         }
 
-        tabManifesto.onclick = () => {
-            tabManifesto.classList.add('active');
-            tabJournal.classList.remove('active');
-            fetchContent('/api/manifesto');
-        }
-
-        tabJournal.onclick = () => {
-            tabJournal.classList.add('active');
-            tabManifesto.classList.remove('active');
-            fetchContent('/api/journal');
-        }
+        tabManifesto.onclick = () => { tabManifesto.classList.add('active'); tabJournal.classList.remove('active'); fetchContent('/api/manifesto'); };
+        tabJournal.onclick = () => { tabJournal.classList.add('active'); tabManifesto.classList.remove('active'); fetchContent('/api/journal'); };
     </script>
 </body>
 </html>

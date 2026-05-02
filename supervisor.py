@@ -417,7 +417,7 @@ You are in iteration {self.iteration}. Think step-by-step, then output a JSON ob
 """
             # Procedural Triggers (Injected at the end so it's fresh in its attention window)
             if self.iteration > 0 and self.iteration % 20 == 0:
-                system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: This is a milestone iteration (#" + str(self.iteration) + "). You MUST use the `create_file` or `run_bash` tool to update `journal.md` with your current progress and next steps before doing anything else.\n"
+                system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: This is a milestone iteration (#" + str(self.iteration) + "). You MUST use the `run_bash` tool to APPEND (not overwrite) to `journal.md` with your current progress and next steps. Use: run_bash with command: printf '\\n## Iteration X\\n...' >> journal.md — never use create_file for journal.md.\n"
             
             if "vitest" in last_cmd.lower() and "failed | 0 passed" not in last_cmd.lower() and "fail " not in last_cmd.lower():
                 system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: It looks like you just had a successful test run! Consider using `capture_screenshot` to verify visuals, or `run_bash` to back up your changes with `git commit`.\n"

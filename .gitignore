@@ -4,3 +4,4 @@ chroma_db/
 *.log
 media/
 .DS_Store
+game_workspace/

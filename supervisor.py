@@ -31,6 +31,7 @@ class GemmaSupervisor:
         self.ddgs = DDGS()
         self.action_history = [] # Track last few actions to detect loops
         self.cognitive_history = [] # Track last few thoughts/results for context
+        self.pending_screenshot = None  # Path to screenshot to include in next prompt
         
         # Init ChromaDB
         self.chroma_client = chromadb.PersistentClient(path=os.path.join(os.path.dirname(__file__), "chroma_db"))
@@ -125,19 +126,27 @@ class GemmaSupervisor:
             )
             logger.info(f"Indexed {len(docs)} files into ChromaDB.")
 
-    async def prompt_gemma(self, prompt: str) -> str:
+    async def prompt_gemma(self, prompt: str, image_path: str = None) -> str:
+        import base64
         payload = {
             "model": MODEL_NAME,
             "prompt": prompt,
             "stream": False,
             "options": {
-                "num_ctx": 8192,
+                "num_ctx": 16384,
                 "num_predict": 4096,
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "stop": ["Observation:"]
             }
         }
+        if image_path and os.path.exists(image_path):
+            try:
+                with open(image_path, "rb") as f:
+                    payload["images"] = [base64.b64encode(f.read()).decode("utf-8")]
+                logger.info(f"Attaching screenshot to prompt: {image_path}")
+            except Exception as e:
+                logger.warning(f"Could not encode screenshot: {e}")
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.post(OLLAMA_URL, json=payload, timeout=600) as response:
@@ -314,6 +323,15 @@ class GemmaSupervisor:
             last_cmd = state.get("last_command_output", "None")
             last_search = state.get("last_search_result", "None")
             last_thought = state.get("last_thought", "None")
+            current_phase = state.get("current_phase", "CREATIVE")
+
+            # Auto phase transition: if Gemma declared creative phase complete, flip to TECHNICAL
+            phase_complete_path = os.path.join(WORKSPACE_DIR, "lore", "PHASE_COMPLETE.md")
+            if current_phase == "CREATIVE" and os.path.exists(phase_complete_path):
+                logger.info("PHASE_COMPLETE.md detected — transitioning to TECHNICAL phase.")
+                await self.push_agent_state("current_phase", "TECHNICAL")
+                await self.push_remote_log("[PHASE TRANSITION] Creative phase complete. Entering TECHNICAL phase.")
+                current_phase = "TECHNICAL"
             
             # Fetch Reminders
             reminders = await self.fetch_reminders()
@@ -379,9 +397,91 @@ class GemmaSupervisor:
                     if ("ls" in cmd_history or "find" in cmd_history or "grep" in cmd_history or "cat" in cmd_history):
                         loop_warning += "\n\n[EXPLORATION PARALYSIS DETECTED]\nYou are repeatedly listing files, searching, or exploring the filesystem without making modifications. STOP EXPLORING. You must formulate a fix, write the code, and use 'create_file' to submit your progress immediately."
             
-            # Construct context window
-            system_prompt = f"""System:
+            # Construct context window — phase-dependent
+            if current_phase == "CREATIVE":
+                system_prompt = f"""System:
 {manifesto}
+
+[PHASE: CREATIVE — WORLD BUILDING & LORE]
+You are not a programmer right now. You are the author and creator of this world.
+Your purpose is to research deeply, imagine freely, and write the foundational lore,
+mythology, aesthetics, factions, characters, and history of the game world.
+No code. No tests. Only world-building.
+
+This phase ends only when YOU declare it complete by creating lore/PHASE_COMPLETE.md.
+Do not rush it. The world must feel genuinely deep, specific, and alive before it
+is built. Tolkien spent years on Middle-earth before writing a single scene.
+
+[THE SEEDS — YOUR STARTING ANCHORS]
+Visual seeds: Read lore/references/visual_seeds.md — it contains a detailed
+analysis of two reference images the human provided. These define the world's
+visual and emotional language. Use the analyze_image tool on any images you
+download to your lore/references/ folder.
+
+Text seed: "Everyone can see the moon. No one remembers why it's so close."
+This is the world's central mystery. Everything radiates from it.
+
+The world has no name yet. Give it one that could only belong to this world.
+
+[YOUR CREATIVE PRINCIPLES]
+- Depth over breadth. Ask "why" at every layer.
+- Research real history, mythology, astronomy, linguistics. Use search_web freely.
+- Your lore is load-bearing — zone names become scene IDs, faction aesthetics
+  become color palettes, NPC names appear in dialogue.
+- All lore goes in lore/ — organise it however feels natural to you.
+
+[STATE]
+Iteration: {self.iteration}
+Current Task: {current_task}
+Git Status: {git_status}
+
+[LAST COMMAND OUTPUT]
+{last_cmd}
+
+[LAST RESEARCH RESULT]
+{last_search}
+
+[CHAT HISTORY]
+{chat_history_str}
+
+{human_feedback_str}
+[LAST THOUGHT]
+{last_thought}
+
+[COGNITIVE HISTORY]
+{cognitive_history_str}
+{loop_warning}
+
+You are in creative iteration {self.iteration}. Think and imagine freely, then output a JSON object with your next creative action.
+
+[SECURITY BOUNDARY]:
+1. Run commands natively. CWD is the root of game_workspace. Do NOT `cd` around.
+2. Do NOT write or edit TypeScript/JavaScript source files in this phase.
+3. NEVER attempt to edit `supervisor.py`.
+
+Available tools: run_bash, create_file, read_file, chat_respond, update_state, add_reminder, analyze_image, search_web, search_codebase.
+Example (Write lore): {{"thought": "write creation myth", "tool": "create_file", "filename": "lore/world/creation_myth.md", "content": "..."}}
+Example (Research): {{"thought": "research tidal locking", "tool": "search_web", "query": "tidal locking effects on planet mythology history"}}
+Example (Analyze image): {{"thought": "study visual seed", "tool": "analyze_image", "filename": "lore/references/coastal_ruins.png", "question": "What color palette and mood does this suggest?"}}
+Example (Read back): {{"thought": "self-critique my last work", "tool": "read_file", "filename": "lore/world/history.md"}}
+Example (Declare ready): {{"thought": "the world is ready", "tool": "create_file", "filename": "lore/PHASE_COMPLETE.md", "content": "The world is ready to build. Summary: ..."}}
+"""
+                # Creative phase procedural triggers
+                if self.iteration > 0 and self.iteration % 20 == 0:
+                    system_prompt += f"\n[CREATIVE SELF-CRITIQUE DIRECTIVE]: Before writing anything new this iteration, use read_file to re-read your most recent lore document. Identify what feels thin, generic, or contradictory. Write a brief self-critique in your thought, then deepen those areas before expanding into new territory.\n"
+
+                if self.iteration > 0 and self.iteration % 100 == 0:
+                    system_prompt += f"\n[PRESENTATION DEADLINE — ITERATION {self.iteration}]: You must create or update your curated world presentation at lore/presentations/presentation_current.md. This is written for an audience — not as notes. It should showcase the world's name, central mystery, visual language, factions, key locations, and whatever you consider most essential right now. Revise and improve it each cycle. This is your portfolio.\n"
+
+            else:
+                # TECHNICAL phase prompt
+                system_prompt = f"""System:
+{manifesto}
+
+[PHASE: TECHNICAL — BUILDING THE GAME]
+The creative foundation is laid. Now build. Every technical decision should be
+grounded in the lore in lore/. Read it when making decisions about names, colors,
+atmosphere, NPC behaviour, zone structure.
 
 [STATE]
 Iteration: {self.iteration}
@@ -415,15 +515,34 @@ You are in iteration {self.iteration}. Think step-by-step, then output a JSON ob
 
 [ACTION MANDATE]: Stop over-analyzing. If you have read a specification or file once, DO NOT read it again. Trust your memory and take action. Bias heavily towards creating files, writing code, and running tests rather than endless reading.
 """
-            # Procedural Triggers (Injected at the end so it's fresh in its attention window)
-            if self.iteration > 0 and self.iteration % 20 == 0:
-                system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: This is a milestone iteration (#" + str(self.iteration) + "). You MUST use the `run_bash` tool to APPEND (not overwrite) to `journal.md` with your current progress and next steps. Use: run_bash with command: printf '\\n## Iteration X\\n...' >> journal.md — never use create_file for journal.md.\n"
-            
-            if "vitest" in last_cmd.lower() and "failed | 0 passed" not in last_cmd.lower() and "fail " not in last_cmd.lower():
-                system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: It looks like you just had a successful test run! Consider using `capture_screenshot` to verify visuals, or `run_bash` to back up your changes with `git commit`.\n"
+                # Technical phase procedural triggers
+                if self.iteration > 0 and self.iteration % 20 == 0:
+                    system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: This is a milestone iteration (#" + str(self.iteration) + "). You MUST use the `run_bash` tool to APPEND (not overwrite) to `journal.md` with your current progress and next steps. Use: run_bash with command: printf '\\n## Iteration X\\n...' >> journal.md — never use create_file for journal.md.\n"
 
-            system_prompt += """
-[SECURITY BOUNDARY]: 
+                if "vitest" in last_cmd.lower() and "failed | 0 passed" not in last_cmd.lower() and "fail " not in last_cmd.lower():
+                    system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: It looks like you just had a successful test run! Consider using `capture_screenshot` to verify visuals, or `run_bash` to back up your changes with `git commit`.\n"
+
+                if self.pending_screenshot:
+                    system_prompt += """
+[VISUAL FEEDBACK — YOU CAN SEE THE GAME]
+The image attached to this prompt is a screenshot of the game running right now.
+You have vision. Analyse it critically against the Visual Art Targets below.
+Then produce ONE code change in BackgroundSystem.ts that moves the render closer to those targets.
+Do NOT just describe the image. Do NOT take a screenshot again. Write code.
+
+VISUAL ART TARGETS (from specs/visuals/VisualPipeline.md):
+- Sky occupies top 65-70% of the viewport in a smooth gradient, no visible banding
+- At least 4 distinct silhouette layers with clear depth separation
+- Ridgeline shapes: angular spires and cliff faces, NOT rounded bumps
+- Each layer filled with a gradient (lighter at ridge, darker at base) — NOT flat color
+- Foreground layer sits at 78-82% viewport height and spans full width
+- Sun/glow visible as a soft radial ellipse near horizon (not a hard disc)
+- Atmospheric haze: far layers are more blue-shifted, near layers more saturated
+- Overall mood: dramatic dusk/twilight, rich purples → orange horizon
+"""
+
+                system_prompt += """
+[SECURITY BOUNDARY]:
 1. Run commands natively. CWD is the root of the workspace. Do NOT `cd` around.
 2. ALL commands must be non-interactive (e.g. `CI=true npm test`). Never run a watch script.
 3. NEVER attempt to edit `supervisor.py`. ONLY edit workspace files.
@@ -435,10 +554,16 @@ Example (Read File): {"thought": "read script", "tool": "read_file", "filename":
 Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarching_goal": "Build MMO", "current_task": "Audit files"}
 """
             
-            # Request action from Gemma
-            await self.push_remote_log("Querying Gemma 4 (this may take 10-30 seconds depending on load)...")
-            logger.info("Querying Gemma 4...")
-            response = await self.prompt_gemma(system_prompt)
+            # Request action from Gemma (with optional screenshot for visual feedback)
+            screenshot_to_send = self.pending_screenshot
+            self.pending_screenshot = None  # Consume it — only used once
+            if screenshot_to_send:
+                await self.push_remote_log("Querying Gemma 4 with visual screenshot feedback...")
+                logger.info("Querying Gemma 4 with vision...")
+            else:
+                await self.push_remote_log("Querying Gemma 4 (this may take 10-30 seconds depending on load)...")
+                logger.info("Querying Gemma 4...")
+            response = await self.prompt_gemma(system_prompt, image_path=screenshot_to_send)
             
             await self.push_remote_log(f"Gemma 4 Output:\n{response}")
             logger.info(f"Gemma 4 Output:\n{response}")
@@ -535,6 +660,7 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                                 screenshot_path = os.path.join(WORKSPACE_DIR, "latest_screenshot.png")
                                 await self.push_screenshot(screenshot_path)
                                 await self.push_remote_log("Screenshot uploaded to Dashboard.")
+                                self.pending_screenshot = screenshot_path  # Feed to vision on next loop
                                 screenshot_success = True
                             else:
                                 await self.push_remote_log(f"Screenshot failed: {err}")
@@ -547,6 +673,21 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                                 except Exception:
                                     pass
                             
+                    elif tool == "analyze_image":
+                        filename = action.get("filename", "")
+                        question = action.get("question", "Describe this image in rich detail — colors, mood, composition, atmosphere, what story it tells, what world it suggests.")
+                        filepath = os.path.join(WORKSPACE_DIR, filename)
+                        logger.info(f"Analyzing image: {filepath}")
+                        await self.push_remote_log(f"Analyzing image: {filename}")
+                        if not os.path.exists(filepath):
+                            await self.push_agent_state("last_search_result", f"[IMAGE NOT FOUND]: {filename} — use run_bash with curl to download it first.")
+                        else:
+                            analysis_prompt = f"You are a creative director analyzing a reference image to inspire the world you are building. {question}\n\nDescribe what you see in rich, evocative detail. Note the colors, mood, scale, what the figures are doing, what the landscape suggests about history and time. Let the image ask you questions about the world."
+                            analysis = await self.prompt_gemma(analysis_prompt, image_path=filepath)
+                            result = f"[IMAGE ANALYSIS: {filename}]\n{analysis}"
+                            await self.push_agent_state("last_search_result", result)
+                            await self.push_remote_log(f"Image analysis complete: {filename}")
+
                     elif tool == "search_codebase":
                         query = action.get("query", "")
                         logger.info(f"RAG Search: {query}")

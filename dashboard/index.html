@@ -191,7 +191,7 @@
 
             const meta = document.createElement('div');
             meta.id = 'featured-meta';
-            meta.textContent = formatTime(shot.timestamp) + '  |  Iteration ' + shot.iteration;
+            meta.textContent = (shot.name ? shot.name + '  ·  ' : '') + formatTime(shot.timestamp) + '  |  Iteration ' + shot.iteration;
             obsFeatured.appendChild(meta);
 
             if (index > 0) {
@@ -208,8 +208,8 @@
             document.querySelectorAll('.thumb').forEach((t, i) => t.classList.toggle('selected', i === index));
         }
 
-        function addScreenshot(url, iteration) {
-            const shot = { url, timestamp: Date.now(), iteration };
+        function addScreenshot(url, iteration, name) {
+            const shot = { url, timestamp: Date.now(), iteration, name: name || '' };
             screenshots.push(shot);
             const idx = screenshots.length - 1;
 
@@ -221,7 +221,8 @@
             img.addEventListener('click', () => selectScreenshot(idx));
             const ts = document.createElement('span');
             ts.className = 'thumb-ts';
-            ts.textContent = formatTime(shot.timestamp);
+            ts.textContent = shot.name || formatTime(shot.timestamp);
+            ts.title = formatTime(shot.timestamp) + ' · Iteration ' + iteration;
             wrap.appendChild(img);
             wrap.appendChild(ts);
             obsTimeline.appendChild(wrap);
@@ -255,8 +256,10 @@
                     terminal.scrollTop = terminal.scrollHeight;
                 } else if (data.type === 'agent_chat') {
                     appendMessage(data.text, 'msg-agent');
+                } else if (data.type === 'human_chat') {
+                    appendMessage(data.text, 'msg-human');
                 } else if (data.type === 'screenshot') {
-                    addScreenshot(data.url, currentIteration);
+                    addScreenshot(data.url, currentIteration, data.name);
                 }
             };
             ws.onclose = () => setTimeout(connect, 2000);

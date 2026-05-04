@@ -207,6 +207,19 @@ class GemmaSupervisor:
             pass
         return "Chat history unavailable."
 
+    async def fetch_pending_chat(self):
+        """Polls the Droplet dashboard for messages typed in the chat panel."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"X-API-KEY": "epiphany_secret_2026"}
+                async with session.get(f"http://{DROPLET_IP}:8080/api/chat/pending", headers=headers, timeout=5) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data.get("messages", [])
+        except Exception:
+            pass
+        return []
+
     async def push_remote_chat(self, message: str):
         """Pushes Gemma's response back to the Droplet UI."""
         try:
@@ -214,6 +227,16 @@ class GemmaSupervisor:
                 headers = {"X-API-KEY": "epiphany_secret_2026"}
                 payload = {"message": message}
                 await session.post(f"http://{DROPLET_IP}:8080/api/chat/response", json=payload, headers=headers, timeout=5)
+        except Exception:
+            pass
+
+    async def push_human_message(self, message: str):
+        """Logs a human message (from human_feedback.md) to the Droplet chat history."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"X-API-KEY": "epiphany_secret_2026"}
+                payload = {"message": message}
+                await session.post(f"http://{DROPLET_IP}:8080/api/chat/human", json=payload, headers=headers, timeout=5)
         except Exception:
             pass
 
@@ -293,10 +316,12 @@ class GemmaSupervisor:
         try:
             with open(filepath, "rb") as f:
                 image_data = f.read()
+            original_name = os.path.basename(filepath)
             async with aiohttp.ClientSession() as session:
                 headers = {
                     "X-API-KEY": "epiphany_secret_2026",
-                    "Content-Type": "image/png"
+                    "Content-Type": "image/png",
+                    "X-Image-Name": original_name,
                 }
                 await session.post(f"http://{DROPLET_IP}:8080/api/screenshot", data=image_data, headers=headers, timeout=10)
         except Exception as e:
@@ -367,23 +392,39 @@ class GemmaSupervisor:
             # Fetch persistent chat history
             chat_history_str = await self.fetch_chat_history()
             
-            # Formulate human feedback
+            # Formulate human feedback — merge file + dashboard chat queue
             human_feedback_str = ""
+            all_messages = []
+
+            # 1. Read from human_feedback.md
             if os.path.exists(FEEDBACK_PATH):
                 with open(FEEDBACK_PATH, "r") as f:
-                    content = f.read().strip()
-                if content and not content.startswith("<!-- Write your feedback"):
-                    human_feedback_str = f"[NEW MESSAGE FROM HUMAN]\n{content}\n[MANDATORY]: You MUST respond to this message using the 'chat_respond' tool THIS iteration before doing anything else. Do not run tests, write code, or take any other action first.\n"
+                    raw = f.read()
+                lines = raw.splitlines()
+                feedback_lines = [l for l in lines if not l.strip().startswith("<!--")]
+                content = "\n".join(feedback_lines).strip()
+                if content:
+                    all_messages.append(content)
+                    await self.push_human_message(content)
                     # Clear it after reading
                     with open(FEEDBACK_PATH, "w") as f:
                         f.write("<!-- Write your feedback or ideas here. The agent will read this on the next loop and then clear the file. -->\n")
+
+            # 2. Poll dashboard chat panel queue
+            dashboard_messages = await self.fetch_pending_chat()
+            all_messages.extend(dashboard_messages)
+
+            if all_messages:
+                combined = "\n\n".join(all_messages)
+                human_feedback_str = f"[NEW MESSAGE FROM HUMAN]\n{combined}\n[MANDATORY]: You MUST respond to this message using the 'chat_respond' tool THIS iteration before doing anything else. Do not run tests, write code, or take any other action first.\n"
             
             # Format cognitive history
             cognitive_history_str = "\n".join(self.cognitive_history) if self.cognitive_history else "No history yet."
             
-            # Loop Detection Logic
+            # Loop Detection Logic — only active in TECHNICAL phase
+            # In CREATIVE phase, repetitive file creation is correct behaviour (writing lore)
             loop_warning = ""
-            if len(self.action_history) >= 3:
+            if current_phase == "TECHNICAL" and len(self.action_history) >= 3:
                 last_3 = self.action_history[-3:]
                 if all(a == last_3[0] for a in last_3):
                     loop_warning += f"\n\n[CRITICAL LOOP DETECTED]\nYou have performed the exact same action '{last_3[0]}' three times in a row and are failing. YOU ARE STUCK. Do NOT repeat this exact action. Instead of abandoning the task, gather new context to diagnose WHY it is failing. For example, use `run_bash` to run `ls -la` and check if your file paths are correct, use `read_file` to verify syntax, or use `search_web`. Identify the root cause and fix it before trying again."
@@ -402,15 +443,24 @@ class GemmaSupervisor:
                 system_prompt = f"""System:
 {manifesto}
 
-[PHASE: CREATIVE — WORLD BUILDING & LORE]
-You are not a programmer right now. You are the author and creator of this world.
-Your purpose is to research deeply, imagine freely, and write the foundational lore,
-mythology, aesthetics, factions, characters, and history of the game world.
-No code. No tests. Only world-building.
+[PHASE: CREATIVE — WORLD BUILDING, LORE & VISUAL DESIGN]
+You are not a programmer right now. You are the author, world-builder, and art director.
+Your purpose is to research deeply, imagine freely, and build the full creative foundation
+of this world — written lore AND visual language.
+
+Creative work has two natural layers, move through both at your own pace:
+1. WRITTEN WORLD — mythology, history, factions, ecology, characters, language, cosmology.
+   Write until the world has a genuine spine. Make it specific and strange.
+2. VISUAL WORLD — once the world has shape, define how it looks. Color palettes per biome.
+   Lighting temperature and direction for key scenes. Silhouette archetypes for architecture
+   and characters. What the sky looks like at each hour. What materials feel like underfoot.
+   These go in lore/visuals/ and are as important as the written lore.
+
+No code. No implementation. No technical files. Only world-building and art direction.
 
 This phase ends only when YOU declare it complete by creating lore/PHASE_COMPLETE.md.
-Do not rush it. The world must feel genuinely deep, specific, and alive before it
-is built. Tolkien spent years on Middle-earth before writing a single scene.
+Do not rush it — and do not leave it either. Tolkien spent years on Middle-earth,
+but he also drew maps and illustrated characters before a word of story was written.
 
 [THE SEEDS — YOUR STARTING ANCHORS]
 Visual seeds: Read lore/references/visual_seeds.md — it contains a detailed
@@ -459,7 +509,12 @@ You are in creative iteration {self.iteration}. Think and imagine freely, then o
 2. Do NOT write or edit TypeScript/JavaScript source files in this phase.
 3. NEVER attempt to edit `supervisor.py`.
 
-Available tools: run_bash, create_file, read_file, chat_respond, update_state, add_reminder, analyze_image, search_web, search_codebase.
+Available tools: run_bash, create_file, read_file, chat_respond, update_state, add_reminder, analyze_image, generate_image, search_web, search_codebase.
+
+generate_image usage: {{"tool": "generate_image", "prompt": "<detailed FLUX prompt - be descriptive, no negative prompt needed>", "filename": "concept_name.png", "width": 1024, "height": 576, "steps": 25, "cfg": 3.5}}
+Model: FLUX.1-dev fp8 (best quality, cinematic, handles complex scenes and lighting).
+FLUX does not use negative prompts - just write a richly detailed positive prompt.
+After generating, ALWAYS call analyze_image on the result to review and critique it before iterating.
 Example (Write lore): {{"thought": "write creation myth", "tool": "create_file", "filename": "lore/world/creation_myth.md", "content": "..."}}
 Example (Research): {{"thought": "research tidal locking", "tool": "search_web", "query": "tidal locking effects on planet mythology history"}}
 Example (Analyze image): {{"thought": "study visual seed", "tool": "analyze_image", "filename": "lore/references/coastal_ruins.png", "question": "What color palette and mood does this suggest?"}}
@@ -687,6 +742,77 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                             result = f"[IMAGE ANALYSIS: {filename}]\n{analysis}"
                             await self.push_agent_state("last_search_result", result)
                             await self.push_remote_log(f"Image analysis complete: {filename}")
+
+                    elif tool == "generate_image":
+                        prompt    = action.get("prompt", "")
+                        filename  = action.get("filename", f"concept_{self.iteration}.png")
+                        width     = int(action.get("width", 1024))
+                        height    = int(action.get("height", 576))
+                        steps     = int(action.get("steps", 25))
+                        cfg       = float(action.get("cfg", 3.5))
+                        out_dir   = os.path.join(WORKSPACE_DIR, "lore", "visuals", "generated")
+                        os.makedirs(out_dir, exist_ok=True)
+                        out_path  = os.path.join(out_dir, filename)
+                        logger.info(f"Generating image: {filename}")
+                        await self.push_remote_log(f"Generating image via ComfyUI FLUX: {filename}")
+                        try:
+                            import uuid as _uuid, time as _time
+                            comfy_url = "http://127.0.0.1:8188"
+                            client_id = str(_uuid.uuid4())
+                            # FLUX.1-dev fp8 workflow: UNETLoader + DualCLIPLoader + FluxGuidance sampler
+                            workflow = {
+                                "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev-fp8.safetensors", "weight_dtype": "fp8_e4m3fn"}},
+                                "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "t5xxl_fp8_e4m3fn.safetensors", "clip_name2": "clip_l.safetensors", "type": "flux", "model_type": "flux"}},
+                                "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+                                "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": prompt}},
+                                "5": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+                                "6": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": cfg}},
+                                "7": {"class_type": "KSampler", "inputs": {
+                                    "model": ["1", 0], "positive": ["6", 0], "negative": ["4", 0],
+                                    "latent_image": ["5", 0], "seed": self.iteration,
+                                    "steps": steps, "cfg": 1.0, "sampler_name": "euler",
+                                    "scheduler": "simple", "denoise": 1.0
+                                }},
+                                "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
+                                "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": os.path.splitext(filename)[0]}},
+                            }
+                            async with aiohttp.ClientSession() as sess:
+                                resp = await sess.post(f"{comfy_url}/prompt", json={"prompt": workflow, "client_id": client_id})
+                                data = await resp.json()
+                                prompt_id = data.get("prompt_id")
+                            # Poll until done (max 5 minutes)
+                            generated_path = None
+                            for _ in range(300):
+                                await asyncio.sleep(1)
+                                async with aiohttp.ClientSession() as sess:
+                                    hr = await sess.get(f"{comfy_url}/history/{prompt_id}")
+                                    hist = await hr.json()
+                                if prompt_id in hist:
+                                    outputs = hist[prompt_id].get("outputs", {})
+                                    for node_out in outputs.values():
+                                        for img in node_out.get("images", []):
+                                            subfolder = img.get("subfolder", "")
+                                            img_name  = img.get("filename", "")
+                                            async with aiohttp.ClientSession() as sess:
+                                                params = {"filename": img_name, "subfolder": subfolder, "type": "output"}
+                                                ir = await sess.get(f"{comfy_url}/view", params=params)
+                                                img_bytes = await ir.read()
+                                            with open(out_path, "wb") as f:
+                                                f.write(img_bytes)
+                                            generated_path = out_path
+                                    break
+                            if generated_path:
+                                rel_path = os.path.relpath(generated_path, WORKSPACE_DIR)
+                                await self.push_agent_state("last_search_result", f"[IMAGE GENERATED]: lore/visuals/generated/{filename} — use analyze_image with filename='lore/visuals/generated/{filename}' to review it.")
+                                await self.push_remote_log(f"Image generated: {rel_path}")
+                                # Auto-push to dashboard
+                                await self.push_screenshot(generated_path)
+                            else:
+                                await self.push_agent_state("last_search_result", "[GENERATE FAILED]: ComfyUI timed out or returned no image.")
+                                await self.push_remote_log("Image generation failed: timeout")
+                        except Exception as e:
+                            await self.push_agent_state("last_search_result", f"[GENERATE ERROR]: {e}")
+                            await self.push_remote_log(f"Image generation error: {e}")
 
                     elif tool == "search_codebase":
                         query = action.get("query", "")

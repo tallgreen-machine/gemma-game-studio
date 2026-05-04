@@ -102,6 +102,19 @@ async def api_push_chat_response(request):
         await ws.send_json({"type": "agent_chat", "text": msg_text})
     return web.json_response({"status": "ok"})
 
+async def api_push_human_message(request):
+    """Supervisor logs a human message (from human_feedback.md) into chat history."""
+    data = await request.json()
+    msg_text = data.get("message", "")
+    if not msg_text:
+        return web.json_response({"error": "No message"}, status=400)
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO chat_history (sender, message) VALUES ('human', $1)", msg_text)
+    for ws in connected_clients:
+        await ws.send_json({"type": "human_chat", "text": msg_text})
+    return web.json_response({"status": "ok"})
+
 async def api_get_chat_history(request):
     """Returns the last 50 chat messages."""
     if not db_pool: return web.json_response({"error": "No DB"}, status=500)
@@ -134,7 +147,17 @@ async def api_push_screenshot(request):
     if not image_data:
         return web.json_response({"error": "No image data"}, status=400)
         
-    filename = f"screenshot_{int(time.time())}.png"
+    original_name = request.headers.get("X-Image-Name", "")
+    # Use the original name if provided, stripping ComfyUI's numeric suffix (e.g. _00001_)
+    if original_name:
+        safe_name = original_name.replace("/", "_")
+        # Strip ComfyUI counter suffix so the label reads cleanly
+        import re as _re
+        label = _re.sub(r'_\d{5}_', '', safe_name).replace('.png', '').replace('_', ' ').strip()
+        filename = f"{int(time.time())}_{safe_name}"
+    else:
+        label = ""
+        filename = f"screenshot_{int(time.time())}.png"
     filepath = os.path.join("media", filename)
     
     with open(filepath, "wb") as f:
@@ -144,7 +167,7 @@ async def api_push_screenshot(request):
     
     # Broadcast to WebSockets
     for ws in connected_clients:
-        await ws.send_json({"type": "screenshot", "url": url})
+        await ws.send_json({"type": "screenshot", "url": url, "name": label})
         
     return web.json_response({"status": "ok", "url": url})
 
@@ -235,6 +258,7 @@ app.add_routes([
     web.get('/api/chat/pending', api_get_pending_chat),
     web.get('/api/chat/history', api_get_chat_history),
     web.delete('/api/chat/history', api_clear_chat_history),
+    web.post('/api/chat/human', api_push_human_message),
     web.post('/api/chat/response', api_push_chat_response),
     web.post('/api/screenshot', api_push_screenshot),
     web.get('/api/state', api_get_state),

@@ -972,5 +972,42 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
             await asyncio.sleep(5) # Prevent ultra-fast looping in case of API failure
 
 if __name__ == "__main__":
+    import atexit
+    import signal
+
+    PID_FILE = os.path.join(os.path.dirname(__file__), "supervisor.pid")
+
+    # --- PID Lock: prevent duplicate instances ---
+    def acquire_pid_lock():
+        if os.path.exists(PID_FILE):
+            try:
+                with open(PID_FILE, "r") as f:
+                    existing_pid = int(f.read().strip())
+                # Check if that process is actually running
+                os.kill(existing_pid, 0)  # Raises OSError if not running
+                print(f"[ABORT] Supervisor already running (PID {existing_pid}). Exiting.")
+                sys.exit(1)
+            except (OSError, ValueError):
+                # Stale PID file — process is dead, safe to overwrite
+                pass
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+
+    def release_pid_lock():
+        try:
+            os.remove(PID_FILE)
+        except FileNotFoundError:
+            pass
+
+    def handle_signal(signum, frame):
+        logger.info(f"Caught signal {signum}, shutting down cleanly.")
+        release_pid_lock()
+        sys.exit(0)
+
+    acquire_pid_lock()
+    atexit.register(release_pid_lock)
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
     supervisor = GemmaSupervisor()
     asyncio.run(supervisor.run_loop())

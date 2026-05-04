@@ -20,9 +20,13 @@ dashboard runs on a remote DigitalOcean droplet.
 ### Local (Mac Studio)
 | Service | How to start | Log |
 |---------|-------------|-----|
-| Supervisor | `cd /Users/max/Repos/gemma_game_dev && venv/bin/python supervisor.py >> supervisor.log 2>&1 &` | `supervisor.log` |
+| Supervisor | `cd /Users/max/Repos/gemma_game_dev && ./start_supervisor.sh` | `supervisor.log` |
 | ComfyUI | `/Users/max/Repos/gemma_game_dev/start_comfyui.sh > /tmp/comfyui.log 2>&1 &` | `/tmp/comfyui.log` |
 | Vite (game client) | `npx vite src/client --port 5175` (from `game_workspace/`) | stdout |
+
+**`start_supervisor.sh` is bulletproof:** kills any existing supervisor (via PID file or process name), cleans stale state, launches a fresh instance, and verifies it started. Always use it instead of running `supervisor.py` directly.
+
+**Supervisor PID lock:** `supervisor.py` writes `supervisor.pid` on startup and checks it on launch — a second instance will refuse to start if one is already running.
 
 **Restart order after crash:** ComfyUI → supervisor → Vite.
 

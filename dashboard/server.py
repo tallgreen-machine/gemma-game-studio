@@ -39,6 +39,16 @@ async def init_db(app):
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS action_log (
+                    id SERIAL PRIMARY KEY,
+                    iteration INT,
+                    tool VARCHAR(50),
+                    summary TEXT,
+                    outcome VARCHAR(20),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
         logger.info("Database connection pool established and tables verified.")
     except Exception as e:
         logger.error(f"Failed to connect to DB: {e}")
@@ -247,6 +257,30 @@ async def api_get_journal(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
+async def api_log_action(request):
+    """Supervisor logs one concise action entry per iteration."""
+    if not db_pool: return web.json_response({"error": "No DB"}, status=500)
+    data = await request.json()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO action_log (iteration, tool, summary, outcome) VALUES ($1, $2, $3, $4)",
+            int(data.get("iteration", 0)), data.get("tool", ""), data.get("summary", ""), data.get("outcome", "ok")
+        )
+    return web.json_response({"status": "ok"})
+
+async def api_get_action_log(request):
+    """Return the last N action log entries (default 20)."""
+    if not db_pool: return web.json_response({"log": []})
+    n = min(int(request.rel_url.query.get("n", 20)), 100)
+    async with db_pool.acquire() as conn:
+        records = await conn.fetch(
+            "SELECT iteration, tool, summary, outcome FROM "
+            "(SELECT * FROM action_log ORDER BY id DESC LIMIT $1) sub ORDER BY id ASC",
+            n
+        )
+    entries = [{"iteration": r["iteration"], "tool": r["tool"], "summary": r["summary"], "outcome": r["outcome"]} for r in records]
+    return web.json_response({"log": entries})
+
 async def api_get_manifesto(request):
     """Serve the content of manifesto.md."""
     try:
@@ -296,6 +330,8 @@ app.add_routes([
     web.post('/api/manifesto', api_update_manifesto),
     web.get('/api/journal', api_get_journal),
     web.post('/api/journal', api_update_journal),
+    web.post('/api/action_log', api_log_action),
+    web.get('/api/action_log', api_get_action_log),
     web.static('/media', 'media')
 ])
 

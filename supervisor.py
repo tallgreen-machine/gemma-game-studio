@@ -34,6 +34,12 @@ class GemmaSupervisor:
         self.pending_screenshot = None  # Path to screenshot to include in next prompt
         self.last_gen_filename = None   # Loop guard: track repeated generate_image filenames
         self.last_gen_repeat_count = 0
+        self.last_build_error_count = None  # For delta tracking across builds
+        self.consecutive_build_count = 0    # How many run_builds in a row with no create_file
+        self.scratchpad = ""               # Gemma's persistent working memory
+        self.last_build_error_count = None  # For delta tracking across builds
+        self.consecutive_build_count = 0    # How many run_builds in a row with no create_file
+        self.scratchpad = ""               # Gemma's persistent working memory, always injected
         
         # Init ChromaDB
         self.chroma_client = chromadb.PersistentClient(path=os.path.join(os.path.dirname(__file__), "chroma_db"))
@@ -135,8 +141,8 @@ class GemmaSupervisor:
             "prompt": prompt,
             "stream": False,
             "options": {
-                "num_ctx": 16384,
-                "num_predict": 4096,
+                "num_ctx": 8192,
+                "num_predict": 2048,
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "stop": ["Observation:"]
@@ -311,6 +317,31 @@ class GemmaSupervisor:
         except Exception:
             pass
 
+    async def push_action_log(self, tool: str, summary: str, outcome: str = "ok"):
+        """Logs a concise one-line action entry to the remote DB."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"X-API-KEY": "epiphany_secret_2026"}
+                payload = {"iteration": self.iteration, "tool": tool, "summary": summary, "outcome": outcome}
+                await session.post(f"http://{DROPLET_IP}:8080/api/action_log", json=payload, headers=headers, timeout=3)
+        except Exception:
+            pass
+
+    async def fetch_action_log(self, n: int = 15) -> str:
+        """Returns last n action log rows formatted as a compact cheat-sheet string."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"X-API-KEY": "epiphany_secret_2026"}
+                async with session.get(f"http://{DROPLET_IP}:8080/api/action_log?n={n}", headers=headers, timeout=5) as r:
+                    data = await r.json()
+                    entries = data.get("log", [])
+            if not entries:
+                return "No actions logged yet."
+            lines = [f"#{e['iteration']:>4} {e['tool']:<20} [{e['outcome']:>4}]  {e['summary']}" for e in entries]
+            return "\n".join(lines)
+        except Exception:
+            return "Action log unavailable."
+
     async def push_screenshot(self, filepath: str):
         """Reads a PNG file and posts the binary data to the Droplet."""
         if not os.path.exists(filepath):
@@ -348,9 +379,13 @@ class GemmaSupervisor:
             current_task = state.get("current_task", "None defined.")
             overarching_goal = state.get("overarching_goal", "None defined.")
             last_cmd = state.get("last_command_output", "None")
+            last_build_result = state.get("last_build_result", "No build run yet.")
             last_search = state.get("last_search_result", "None")
             last_thought = state.get("last_thought", "None")
             current_phase = state.get("current_phase", "CREATIVE")
+
+            # Fetch compact action log for TECHNICAL phase cheat-sheet
+            action_log_str = await self.fetch_action_log(15) if current_phase == "TECHNICAL" else ""
 
             # Auto phase transition: if Gemma declared creative phase complete, flip to TECHNICAL
             phase_complete_path = os.path.join(WORKSPACE_DIR, "lore", "PHASE_COMPLETE.md")
@@ -418,10 +453,14 @@ class GemmaSupervisor:
 
             if all_messages:
                 combined = "\n\n".join(all_messages)
-                human_feedback_str = f"[NEW MESSAGE FROM HUMAN]\n{combined}\n[MANDATORY]: You MUST respond to this message using the 'chat_respond' tool THIS iteration before doing anything else. Do not run tests, write code, or take any other action first.\n"
+                human_feedback_str = f"[NEW MESSAGE FROM HUMAN]\n{combined}\n"
             
             # Format cognitive history
             cognitive_history_str = "\n".join(self.cognitive_history) if self.cognitive_history else "No history yet."
+
+            # Restore scratchpad from DB if lost across restarts
+            if not self.scratchpad:
+                self.scratchpad = state.get("scratchpad", "")
             
             # Loop Detection Logic — only active in TECHNICAL phase
             # In CREATIVE phase, repetitive file creation is correct behaviour (writing lore)
@@ -429,7 +468,7 @@ class GemmaSupervisor:
             if current_phase == "TECHNICAL" and len(self.action_history) >= 3:
                 last_3 = self.action_history[-3:]
                 if all(a == last_3[0] for a in last_3):
-                    loop_warning += f"\n\n[CRITICAL LOOP DETECTED]\nYou have performed the exact same action '{last_3[0]}' three times in a row and are failing. YOU ARE STUCK. Do NOT repeat this exact action. Instead of abandoning the task, gather new context to diagnose WHY it is failing. For example, use `run_bash` to run `ls -la` and check if your file paths are correct, use `read_file` to verify syntax, or use `search_web`. Identify the root cause and fix it before trying again."
+                    loop_warning += f"\n\n[OBSERVATION] The last 3 actions were identical: '{last_3[0]}'. The result has not changed."
                 
                 # Semantic Loop Detection for Exploration Paralysis
                 tools_used = [a.split(":")[0] if ":" in a else a for a in self.action_history]
@@ -438,7 +477,12 @@ class GemmaSupervisor:
                 if len(tools_used) >= 4 and all(t in read_only_tools for t in tools_used[-4:]):
                     cmd_history = " ".join(self.action_history[-4:])
                     if ("ls" in cmd_history or "find" in cmd_history or "grep" in cmd_history or "cat" in cmd_history):
-                        loop_warning += "\n\n[EXPLORATION PARALYSIS DETECTED]\nYou are repeatedly listing files, searching, or exploring the filesystem without making modifications. STOP EXPLORING. You must formulate a fix, write the code, and use 'create_file' to submit your progress immediately."
+                        loop_warning += "\n\n[OBSERVATION] The last 4 actions were all read-only (listing files, searching, reading). No files have been written recently."
+
+            # Consecutive build observation (purely informational)
+            build_spin_note = ""
+            if current_phase == "TECHNICAL" and self.consecutive_build_count >= 3:
+                build_spin_note = f"\n\n[OBSERVATION] run_build has been called {self.consecutive_build_count} times in a row without any file being written in between."
             
             # Construct context window — phase-dependent
             if current_phase == "CREATIVE":
@@ -532,7 +576,7 @@ BEST MODEL: illustriousXL_v01.safetensors — fine-tuned for stylized illustrati
 Recommended cfg: 7.5. Steps: 28. Width/height: use 1024x512 for landscape, 512x512 for portraits.
 
 generate_image usage: {{"tool": "generate_image", "prompt": "rust orange lowland plateau, (cyan energy leak:1.3), brutalist ruin silhouette, (side scroll background layer:1.2), game concept art, matte painting, atmospheric haze", "negative": "photorealistic, 3d render, blurry, soft focus, text, watermark, gradient sky", "filename": "bg_grounded_lowlands_layer1.png", "model": "illustriousXL_v01.safetensors", "width": 1024, "height": 512, "steps": 28, "cfg": 7.5}}
-Available models: illustriousXL_v01.safetensors (best for Khoros), epicrealismXL_pureFix.safetensors, realvisxlV50_v50LightningBakedvae.safetensors, sd_xl_base_1.0.safetensors.
+Available models: illustriousXL_v01.safetensors (best for Khoros), sd_xl_base_1.0.safetensors.
 Example (Write lore): {{"thought": "write creation myth", "tool": "create_file", "filename": "lore/world/creation_myth.md", "content": "..."}}
 Example (Research): {{"thought": "research tidal locking", "tool": "search_web", "query": "tidal locking effects on planet mythology history"}}
 Example (Analyze image): {{"thought": "study visual seed", "tool": "analyze_image", "filename": "lore/references/coastal_ruins.png", "question": "What color palette and mood does this suggest?"}}
@@ -569,6 +613,13 @@ Git Status:
 [LAST COMMAND OUTPUT]
 {last_cmd}
 
+[LAST BUILD RESULT — persists until next run_build]
+{last_build_result}
+
+[RECENT ACTION LOG — last 15 iterations, supervisor-generated]
+Format: #iter  tool                 [outcome]  summary
+{action_log_str}
+
 [LAST RAG SEARCH RESULT]
 {last_search}
 
@@ -585,17 +636,19 @@ Git Status:
 [COGNITIVE HISTORY]
 {cognitive_history_str}
 {loop_warning}
+{build_spin_note}
+
+[SCRATCHPAD — your persistent working memory, use write_scratchpad to update]
+{self.scratchpad if self.scratchpad else '(empty — use write_scratchpad to jot hypotheses, root causes, and what you have tried)'}
 
 You are in iteration {self.iteration}. Think step-by-step, then output a JSON object with your next action.
-
-[ACTION MANDATE]: Stop over-analyzing. If you have read a specification or file once, DO NOT read it again. Trust your memory and take action. Bias heavily towards creating files, writing code, and running tests rather than endless reading.
 """
                 # Technical phase procedural triggers
                 if self.iteration > 0 and self.iteration % 20 == 0:
-                    system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: This is a milestone iteration (#" + str(self.iteration) + "). You MUST use the `run_bash` tool to APPEND (not overwrite) to `journal.md` with your current progress and next steps. Use: run_bash with command: printf '\\n## Iteration X\\n...' >> journal.md — never use create_file for journal.md.\n"
+                    system_prompt += "\n[MILESTONE — Iteration #" + str(self.iteration) + "]: Consider appending a progress note to journal.md: run_bash with command: printf '\\n## Iteration " + str(self.iteration) + "\\n...' >> journal.md\n"
 
                 if "vitest" in last_cmd.lower() and "failed | 0 passed" not in last_cmd.lower() and "fail " not in last_cmd.lower():
-                    system_prompt += "\n[MANDATORY SYSTEM DIRECTIVE]: It looks like you just had a successful test run! Consider using `capture_screenshot` to verify visuals, or `run_bash` to back up your changes with `git commit`.\n"
+                    system_prompt += "\n[OBSERVATION] The last command looks like a passing test run.\n"
 
                 if self.pending_screenshot:
                     system_prompt += """
@@ -622,13 +675,16 @@ VISUAL ART TARGETS (from specs/visuals/VisualPipeline.md):
 2. ALL commands must be non-interactive (e.g. `CI=true npm test`). Never run a watch script.
 3. NEVER attempt to edit `supervisor.py`. ONLY edit workspace files.
 
-Available tools: run_bash, run_build, run_tests, create_file, read_file, chat_respond, update_state, add_reminder, capture_screenshot, search_codebase, search_web.
+Available tools: run_bash, run_build, run_tests, create_file, read_file, write_scratchpad, chat_respond, update_state, add_reminder, capture_screenshot, search_codebase, search_web.
 
-run_build: Compiles the TypeScript project and returns all errors. Use this AFTER every code change to verify the build is clean before doing anything else. Zero errors = safe to screenshot.
+run_build: Compiles the TypeScript project and returns errors grouped by file with a delta vs last run.
 Example: {"thought": "check for TS errors", "tool": "run_build"}
 
 run_tests: Runs the Vitest test suite and returns pass/fail results.
 Example: {"thought": "run tests", "tool": "run_tests"}
+
+write_scratchpad: Overwrite your persistent working memory (always visible in next prompt). Use to track your current hypothesis, what you have tried, and what you plan next.
+Example: {"thought": "note root cause", "tool": "write_scratchpad", "note": "Root cause: CoreEngine.ts L18 imports GameStateManager as type but it's a class. Plan: add 'typeof' or fix import."}
 
 Example (Command): {"thought": "list files", "tool": "run_bash", "command": "ls -R"}
 Example (Create File): {"thought": "write script", "tool": "create_file", "filename": "test.py", "content": "print('hello')"}
@@ -658,10 +714,24 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                 
             # Basic JSON parsing and tool execution
             try:
-                json_start = response.find("{")
-                json_end = response.rfind("}") + 1
-                if json_start != -1 and json_end != 0:
-                    action = json.loads(response[json_start:json_end])
+                # Extract all JSON objects from the response; use the last one
+                # (Gemma often self-corrects by outputting a second JSON block)
+                import re as _re
+                _json_blocks = list(_re.finditer(r'\{', response))
+                action = None
+                for _m in reversed(_json_blocks):
+                    _start = _m.start()
+                    _end = response.rfind("}", _start) + 1
+                    try:
+                        action = json.loads(response[_start:_end])
+                        json_start, json_end = _start, _end
+                        break
+                    except json.JSONDecodeError:
+                        continue
+                if action is None:
+                    json_start = response.find("{")
+                    json_end = response.rfind("}") + 1
+                if json_start != -1 and json_end != 0 and action is not None:
                     # Fallback support for hallucination patterns
                     if "tool" not in action and "action" in action:
                         if action["action"] in ["create_file", "write_file"]:
@@ -670,8 +740,53 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                             action["tool"] = "chat_respond"
                             if "text" in action and "message" not in action:
                                 action["message"] = action["text"]
+                        elif action["action"] == "run":
+                            ai = action.get("action_input", "")
+                            cmd_raw = action.get("command", ai)
+                            cmd = str(cmd_raw) if not isinstance(cmd_raw, dict) else ""
+                            # Map build commands to run_build
+                            if any(x in cmd for x in ["npm run build", "tsc", "npx tsc"]):
+                                action["tool"] = "run_build"
+                            elif any(x in cmd for x in ["vitest", "npm test", "npm run test"]):
+                                action["tool"] = "run_tests"
+                            else:
+                                action["tool"] = "run_bash"
+                                action["command"] = cmd
+                        elif action["action"] in ["bash", "execute_bash", "run_command", "run_bash", "terminal"]:
+                            action["tool"] = "run_bash"
+                            action["command"] = action.get("command", action.get("action_input", ""))
+                        elif action["action"] == "read_file":
+                            action["tool"] = "read_file"
+                            ai = action.get("action_input", "")
+                            if isinstance(ai, dict):
+                                action["filename"] = ai.get("path", ai.get("filename", ""))
+                            else:
+                                action["filename"] = str(ai)
+                        elif action["action"] == "write_to_file":
+                            action["tool"] = "create_file"
+                            ai = action.get("action_input", {})
+                            if isinstance(ai, dict):
+                                action["filename"] = ai.get("path", ai.get("filename", ""))
+                                action["content"] = ai.get("content", "")
+                        elif action["action"] == "list_directory":
+                            action["tool"] = "run_bash"
+                            ai = action.get("action_input", ".")
+                            path = ai.get("path", ".") if isinstance(ai, dict) else str(ai)
+                            action["command"] = f"ls -la {path}"
                             
                     tool = action.get("tool")
+                    # Normalize wrong-but-close tool names
+                    if tool in ["bash", "execute_bash", "run_command", "terminal", "execute"]:
+                        tool = "run_bash"
+                        action["tool"] = "run_bash"
+                    elif tool == "write_file":
+                        tool = "create_file"
+                        action["tool"] = "create_file"
+                    # Extract command from nested args/parameters dict
+                    if tool == "run_bash" and not isinstance(action.get("command"), str):
+                        nested = action.get("args") or action.get("parameters") or action.get("params") or {}
+                        if isinstance(nested, dict) and "command" in nested:
+                            action["command"] = nested["command"]
                     if tool == "write_file":
                         tool = "create_file"
                         
@@ -686,6 +801,7 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                         msg = action.get("message", action.get("content", action.get("text", "")))
                         logger.info(f"Agent Chat: {msg}")
                         await self.push_remote_chat(msg)
+                        await self.push_action_log("chat_respond", msg[:100], "ok")
                         
                     elif tool == "update_state":
                         # Support top-level keys, 'parameters', or 'params'
@@ -711,12 +827,15 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                             logger.info(f"Updating state: {k}={v}")
                             await self.push_agent_state(k, v)
                             await self.push_remote_log(f"State Updated: {k}={v}")
+                        if updates:
+                            await self.push_action_log("update_state", f"Updated: {list(updates.keys())}", "ok")
                         
                     elif tool == "add_reminder":
                         note = action.get("note", "")
                         logger.info(f"Adding reminder: {note}")
                         await self.push_reminder(note)
                         await self.push_remote_log(f"Reminder Added: {note}")
+                        await self.push_action_log("add_reminder", note[:100], "ok")
                         
                     elif tool == "run_build":
                         logger.info("Running TypeScript build check...")
@@ -724,13 +843,54 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                         code, out, err = await self.execute_native("npx tsc --noEmit 2>&1")
                         combined = (out + err).strip()
                         error_count = combined.count("error TS")
+                        self.consecutive_build_count += 1
                         if code == 0 or error_count == 0:
                             result = "[BUILD OK] TypeScript compiled with no errors."
+                            await self.push_action_log("run_build", "BUILD OK — 0 errors", "ok")
+                            self.last_build_error_count = 0
+                            self.consecutive_build_count = 0
                         else:
-                            result = f"[BUILD FAILED] {error_count} TypeScript error(s):\n{combined[:4000]}"
+                            # Per-file error grouping
+                            import re as _re, collections as _col
+                            file_counts = _col.Counter()
+                            for line in combined.split('\n'):
+                                m = _re.match(r'^([^(]+)\(', line)
+                                if m and 'error TS' in line:
+                                    fname = m.group(1).strip().split('/')[-1]
+                                    file_counts[fname] += 1
+                            file_summary = "\n".join(
+                                f"  {fname:<45} {cnt:>3} error(s)"
+                                for fname, cnt in file_counts.most_common()
+                            )
+                            # Delta vs previous build
+                            if self.last_build_error_count is not None:
+                                delta = error_count - self.last_build_error_count
+                                if delta < 0:
+                                    delta_str = f"  ({abs(delta)} fewer than last build)"
+                                elif delta > 0:
+                                    delta_str = f"  ({delta} more than last build)"
+                                else:
+                                    delta_str = "  (same as last build)"
+                            else:
+                                delta_str = ""
+                            first_err = next((l for l in combined.split('\n') if 'error TS' in l), "")[:120]
+                            result = (
+                                f"[BUILD FAILED] {error_count} TypeScript error(s){delta_str}\n"
+                                f"\nErrors by file (most errors first):\n{file_summary}\n"
+                                f"\nFull output:\n{combined[:3500]}"
+                            )
+                            await self.push_action_log("run_build", f"FAILED {error_count} errors{delta_str} | top: {file_summary.split(chr(10))[0].strip()}", "fail")
+                            self.last_build_error_count = error_count
                         await self.push_agent_state("last_build_result", result)
-                        await self.push_remote_log(result[:300])
-                        logger.info(result[:300])
+                        await self.push_remote_log(result[:500])
+                        logger.info(result[:500])
+
+                    elif tool == "write_scratchpad":
+                        note = action.get("note", action.get("content", ""))
+                        self.scratchpad = note  # Overwrites — Gemma maintains it herself
+                        await self.push_agent_state("scratchpad", note)
+                        await self.push_remote_log(f"Scratchpad updated ({len(note)} chars)")
+                        await self.push_action_log("write_scratchpad", note[:80], "ok")
 
                     elif tool == "run_tests":
                         logger.info("Running Vitest test suite...")
@@ -741,6 +901,7 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                         await self.push_agent_state("last_test_result", result)
                         await self.push_remote_log(result[:300])
                         logger.info(result[:300])
+                        await self.push_action_log("run_tests", result.split('\n')[0][:100], "ok" if code == 0 else "fail")
 
                     elif tool == "capture_screenshot":
                         logger.info("Capturing screenshot via Playwright...")
@@ -785,8 +946,10 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                                     await self.push_screenshot(screenshot_path)
                                     await self.push_remote_log(f"Screenshot captured ({size} bytes) and uploaded to Dashboard.")
                                     self.pending_screenshot = screenshot_path
+                                    await self.push_action_log("capture_screenshot", f"{size}b captured", "ok" if size > 10240 else "warn")
                                 else:
                                     await self.push_remote_log(f"Screenshot failed: {err}")
+                                    await self.push_action_log("capture_screenshot", f"FAILED: {err[:80]}", "fail")
                         except Exception as e:
                             await self.push_remote_log(f"Screenshot error: {e}")
                         finally:
@@ -834,7 +997,7 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                             await self.push_remote_log(f"[LOOP GUARD] Blocked repeat generation #{self.last_gen_repeat_count}: {filename}")
                             continue
                         # Resolve model: accept Gemma's hint if it's a known SDXL/SD checkpoint; skip FLUX models
-                        _sdxl_models = {"illustriousXL_v01.safetensors", "sd_xl_base_1.0.safetensors", "epicrealismXL_pureFix.safetensors", "realvisxlV50_v50LightningBakedvae.safetensors"}
+                        _sdxl_models = {"illustriousXL_v01.safetensors", "sd_xl_base_1.0.safetensors"}
                         _requested_model = action.get("model", "")
                         _ckpt_dir = "/Users/max/ComfyUI/models/checkpoints/"
                         _preferred_default = "illustriousXL_v01.safetensors" if os.path.exists(_ckpt_dir + "illustriousXL_v01.safetensors") else "sd_xl_base_1.0.safetensors"
@@ -920,6 +1083,7 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                                     
                             await self.push_agent_state("last_search_result", res_str)
                             await self.push_remote_log("Search complete. Results added to next prompt.")
+                            await self.push_action_log("search_codebase", f"'{query[:60]}' → {len(docs)} results", "ok")
                         except Exception as e:
                             await self.push_remote_log(f"Search failed: {str(e)}")
                             
@@ -931,6 +1095,7 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                             results = self.search_web(query)
                             await self.push_agent_state("last_search_result", results)
                             await self.push_remote_log("Web search complete. Results added to next prompt.")
+                            await self.push_action_log("search_web", f"'{query[:80]}'", "ok")
                         except Exception as e:
                             await self.push_remote_log(f"Web search failed: {str(e)}")
                             
@@ -964,8 +1129,11 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                         self.cognitive_history.append(f"Iteration {self.iteration}: Ran '{short_cmd}'")
                         if len(self.cognitive_history) > 10:
                             self.cognitive_history.pop(0)
-                        
+                        first_out = (out.strip().split('\n')[0] if out.strip() else err.strip()[:80])[:80]
+                        await self.push_action_log("run_bash", f"`{cmd[:50]}` → {first_out}", "ok" if code == 0 else "fail")
+
                     elif tool == "create_file":
+                        self.consecutive_build_count = 0  # Writing code resets the build-spin counter
                         filename = action.get("filename", "")
                         content = action.get("content", "")
                         msg = f"Creating file: {filename}"
@@ -989,12 +1157,14 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                             self.cognitive_history.append(f"Iteration {self.iteration}: Created '{filename}'. Result: Success.")
                             if len(self.cognitive_history) > 10:
                                 self.cognitive_history.pop(0)
+                            await self.push_action_log("create_file", filename, "ok")
                         except Exception as e:
                             res_msg = f"Failed to create file: {str(e)}"
                             await self.push_agent_state("last_command_output", res_msg)
                             await self.push_remote_log(res_msg)
                             self.failures += 1
                             await self.push_agent_state("consecutive_failures", str(self.failures))
+                            await self.push_action_log("create_file", f"FAILED {filename}: {str(e)[:80]}", "fail")
                             
                     elif tool == "read_file":
                         filename = action.get("filename", "")
@@ -1020,12 +1190,14 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                             self.cognitive_history.append(f"Iteration {self.iteration}: Read '{filename}'.")
                             if len(self.cognitive_history) > 10:
                                 self.cognitive_history.pop(0)
+                            await self.push_action_log("read_file", filename, "ok")
                         except Exception as e:
                             res_msg = f"Failed to read file: {str(e)}"
                             await self.push_agent_state("last_cmd", res_msg)
                             await self.push_remote_log(res_msg)
                             self.failures += 1
                             await self.push_agent_state("consecutive_failures", str(self.failures))
+                            await self.push_action_log("read_file", f"FAILED {filename}: {str(e)[:80]}", "fail")
                             
                     else:
                         err_msg = f"JSON Parser Error: Invalid or missing 'tool' key. You must use 'tool': 'run_bash' and 'command': '<your command>'. You provided: {response[json_start:json_end]}"

@@ -47,6 +47,8 @@ dashboard runs on a remote DigitalOcean droplet.
 
 **Supervisor PID lock:** `supervisor.py` writes `supervisor.pid` on startup and checks it on launch — a second instance will refuse to start if one is already running.
 
+**VS Code buffer vs disk:** Editor tool writes (`replace_string_in_file`, `create_file`) go to VS Code's in-memory buffer, NOT to disk immediately. Always run `workbench.action.files.saveAll` after any edit to `supervisor.py` before verifying with `grep` or restarting the supervisor. Terminal writes via `run_in_terminal` go directly to disk and don't need this step.
+
 **Restart order after crash:** ComfyUI → supervisor → Vite.
 
 ### Remote Droplet (DigitalOcean)

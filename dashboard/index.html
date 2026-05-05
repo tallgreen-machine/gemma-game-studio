@@ -288,6 +288,17 @@
         }
         loadChatHistory();
 
+        async function loadScreenshots() {
+            try {
+                const base = window.location.protocol + '//' + window.location.host;
+                const res = await fetch(base + '/api/screenshots', { headers: { 'X-API-KEY': 'epiphany_secret_2026' } });
+                if (!res.ok) return;
+                const data = await res.json();
+                data.screenshots.forEach(s => addScreenshot(s.url, 0, s.name));
+            } catch (err) { console.error('Failed to load screenshot history:', err); }
+        }
+        loadScreenshots();
+
         function sendMessage() {
             const text = chatInput.value.trim();
             if (!text) return;

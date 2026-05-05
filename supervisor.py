@@ -32,6 +32,8 @@ class GemmaSupervisor:
         self.action_history = [] # Track last few actions to detect loops
         self.cognitive_history = [] # Track last few thoughts/results for context
         self.pending_screenshot = None  # Path to screenshot to include in next prompt
+        self.last_gen_filename = None   # Loop guard: track repeated generate_image filenames
+        self.last_gen_repeat_count = 0
         
         # Init ChromaDB
         self.chroma_client = chromadb.PersistentClient(path=os.path.join(os.path.dirname(__file__), "chroma_db"))
@@ -511,13 +513,31 @@ You are in creative iteration {self.iteration}. Think and imagine freely, then o
 
 Available tools: run_bash, create_file, read_file, chat_respond, update_state, add_reminder, analyze_image, generate_image, search_web, search_codebase.
 
-generate_image usage: {{"tool": "generate_image", "prompt": "<detailed FLUX prompt - be descriptive, no negative prompt needed>", "filename": "concept_name.png", "width": 1024, "height": 576, "steps": 25, "cfg": 3.5}}
-Model: FLUX.1-dev fp8 (best quality, cinematic, handles complex scenes and lighting).
-FLUX does not use negative prompts - just write a richly detailed positive prompt.
-After generating, ALWAYS call analyze_image on the result to review and critique it before iterating.
+generate_image is for producing GAME ART ASSETS — not paintings or illustrations. Every image must serve a specific production purpose.
+
+ASSET TYPES (choose the right one):
+  background_layer  — parallax BG slice: width=1024, height=512. Single depth layer.
+  environment_concept — overall scene reference: width=1024, height=576.
+  character_silhouette — NPC/player shape on plain dark bg: width=512, height=512.
+  prop_sheet — objects on clean bg, multiple angles: width=768, height=512.
+
+SDXL PROMPTING RULES — use comma-separated weighted tags, NOT long sentences:
+  GOOD: "rust orange cliffside, (cyan energy vein:1.3), game concept art, side view, matte painting, silhouette"
+  BAD: "A wide cinematic shot of a cliffside bathed in cyan light under a bruised sky..."
+  Boost important tags with (tag:1.3), reduce noise with (tag:0.7).
+  Put the MOST IMPORTANT tags FIRST. Short tags score higher than prose.
+  Always specify: viewpoint (side view / front view / top-down), style (game concept art / 2D matte painting), and asset type.
+
+BEST MODEL: illustriousXL_v01.safetensors — fine-tuned for stylized illustration and game art, strong on silhouettes, flat/cel styles, and Khoros's rust+cyan palette.
+Recommended cfg: 7.5. Steps: 28. Width/height: use 1024x512 for landscape, 512x512 for portraits.
+
+generate_image usage: {{"tool": "generate_image", "prompt": "rust orange lowland plateau, (cyan energy leak:1.3), brutalist ruin silhouette, (side scroll background layer:1.2), game concept art, matte painting, atmospheric haze", "negative": "photorealistic, 3d render, blurry, soft focus, text, watermark, gradient sky", "filename": "bg_grounded_lowlands_layer1.png", "model": "illustriousXL_v01.safetensors", "width": 1024, "height": 512, "steps": 28, "cfg": 7.5}}
+Available models: illustriousXL_v01.safetensors (best for Khoros), epicrealismXL_pureFix.safetensors, realvisxlV50_v50LightningBakedvae.safetensors, sd_xl_base_1.0.safetensors.
 Example (Write lore): {{"thought": "write creation myth", "tool": "create_file", "filename": "lore/world/creation_myth.md", "content": "..."}}
 Example (Research): {{"thought": "research tidal locking", "tool": "search_web", "query": "tidal locking effects on planet mythology history"}}
 Example (Analyze image): {{"thought": "study visual seed", "tool": "analyze_image", "filename": "lore/references/coastal_ruins.png", "question": "What color palette and mood does this suggest?"}}
+update_state usage: {{"tool": "update_state", "current_task": "what you are doing right now", "overarching_goal": "optional high-level goal"}}
+Example (Update state): {{"thought": "pivot to style research", "tool": "update_state", "current_task": "Visual Style Decision — testing Schematic Minimalism hypothesis"}}
 Example (Read back): {{"thought": "self-critique my last work", "tool": "read_file", "filename": "lore/world/history.md"}}
 Example (Declare ready): {{"thought": "the world is ready", "tool": "create_file", "filename": "lore/PHASE_COMPLETE.md", "content": "The world is ready to build. Summary: ..."}}
 """
@@ -602,7 +622,14 @@ VISUAL ART TARGETS (from specs/visuals/VisualPipeline.md):
 2. ALL commands must be non-interactive (e.g. `CI=true npm test`). Never run a watch script.
 3. NEVER attempt to edit `supervisor.py`. ONLY edit workspace files.
 
-Available tools: run_bash, create_file, read_file, chat_respond, update_state, add_reminder, capture_screenshot, search_codebase, search_web.
+Available tools: run_bash, run_build, run_tests, create_file, read_file, chat_respond, update_state, add_reminder, capture_screenshot, search_codebase, search_web.
+
+run_build: Compiles the TypeScript project and returns all errors. Use this AFTER every code change to verify the build is clean before doing anything else. Zero errors = safe to screenshot.
+Example: {"thought": "check for TS errors", "tool": "run_build"}
+
+run_tests: Runs the Vitest test suite and returns pass/fail results.
+Example: {"thought": "run tests", "tool": "run_tests"}
+
 Example (Command): {"thought": "list files", "tool": "run_bash", "command": "ls -R"}
 Example (Create File): {"thought": "write script", "tool": "create_file", "filename": "test.py", "content": "print('hello')"}
 Example (Read File): {"thought": "read script", "tool": "read_file", "filename": "test.py"}
@@ -669,6 +696,11 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                             if k in data:
                                 updates[k] = data[k]
                         
+                        # Accept common hallucination aliases for current_task
+                        for alias in ["state", "content", "task", "description"]:
+                            if alias in data and "current_task" not in updates:
+                                updates["current_task"] = data[alias]
+
                         if "key" in action and "value" in action: # Legacy support
                             updates[action["key"]] = action["value"]
                             
@@ -686,39 +718,75 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
                         await self.push_reminder(note)
                         await self.push_remote_log(f"Reminder Added: {note}")
                         
+                    elif tool == "run_build":
+                        logger.info("Running TypeScript build check...")
+                        await self.push_remote_log("Running tsc --noEmit...")
+                        code, out, err = await self.execute_native("npx tsc --noEmit 2>&1")
+                        combined = (out + err).strip()
+                        error_count = combined.count("error TS")
+                        if code == 0 or error_count == 0:
+                            result = "[BUILD OK] TypeScript compiled with no errors."
+                        else:
+                            result = f"[BUILD FAILED] {error_count} TypeScript error(s):\n{combined[:4000]}"
+                        await self.push_agent_state("last_build_result", result)
+                        await self.push_remote_log(result[:300])
+                        logger.info(result[:300])
+
+                    elif tool == "run_tests":
+                        logger.info("Running Vitest test suite...")
+                        await self.push_remote_log("Running vitest run...")
+                        code, out, err = await self.execute_native("CI=true npx vitest run 2>&1")
+                        combined = (out + err).strip()
+                        result = f"[TESTS {'PASSED' if code == 0 else 'FAILED'}]\n{combined[:4000]}"
+                        await self.push_agent_state("last_test_result", result)
+                        await self.push_remote_log(result[:300])
+                        logger.info(result[:300])
+
                     elif tool == "capture_screenshot":
                         logger.info("Capturing screenshot via Playwright...")
                         await self.push_remote_log("Capturing screenshot via Playwright...")
-                        # Start Vite dev server temporarily, wait for it to be ready, then screenshot
                         import subprocess as _sp, signal as _sig, time as _time
                         vite_proc = None
-                        screenshot_success = False
                         try:
-                            vite_proc = _sp.Popen(
-                                ["npx", "vite", "--port", "5173"],
-                                cwd=WORKSPACE_DIR,
-                                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-                                preexec_fn=os.setsid
-                            )
-                            # Wait up to 10s for Vite to be ready
-                            import socket as _sock
-                            for _ in range(20):
-                                _time.sleep(0.5)
-                                try:
-                                    s = _sock.create_connection(("localhost", 5173), timeout=1)
-                                    s.close()
-                                    break
-                                except OSError:
-                                    pass
-                            code, out, err = await self.execute_native("node capture_screenshot.js")
-                            if code == 0:
-                                screenshot_path = os.path.join(WORKSPACE_DIR, "latest_screenshot.png")
-                                await self.push_screenshot(screenshot_path)
-                                await self.push_remote_log("Screenshot uploaded to Dashboard.")
-                                self.pending_screenshot = screenshot_path  # Feed to vision on next loop
-                                screenshot_success = True
+                            # First check build is clean — a broken build = blank page
+                            build_code, build_out, build_err = await self.execute_native("npx tsc --noEmit 2>&1")
+                            build_errors = (build_out + build_err).count("error TS")
+                            if build_errors > 0:
+                                msg = f"[SCREENSHOT BLOCKED] Build has {build_errors} TypeScript error(s). Run run_build to see them, fix all errors, then screenshot."
+                                await self.push_agent_state("last_build_result", msg)
+                                await self.push_remote_log(msg)
+                                logger.warning(msg)
                             else:
-                                await self.push_remote_log(f"Screenshot failed: {err}")
+                                vite_proc = _sp.Popen(
+                                    ["npx", "vite", "--port", "5173"],
+                                    cwd=WORKSPACE_DIR,
+                                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                                    preexec_fn=os.setsid
+                                )
+                                # Wait up to 15s for Vite port to open
+                                import socket as _sock
+                                for _ in range(30):
+                                    _time.sleep(0.5)
+                                    try:
+                                        s = _sock.create_connection(("localhost", 5173), timeout=1)
+                                        s.close()
+                                        break
+                                    except OSError:
+                                        pass
+                                # Extra 4s for PixiJS canvas to initialize after port is up
+                                _time.sleep(4)
+                                code, out, err = await self.execute_native("node capture_screenshot.js")
+                                if code == 0:
+                                    screenshot_path = os.path.join(WORKSPACE_DIR, "latest_screenshot.png")
+                                    # Check file is non-trivial (>10KB = real render, not blank page)
+                                    size = os.path.getsize(screenshot_path) if os.path.exists(screenshot_path) else 0
+                                    if size < 10240:
+                                        await self.push_remote_log(f"[SCREENSHOT WARNING] File is only {size} bytes — the page may not have rendered. Check browser console errors via run_build first.")
+                                    await self.push_screenshot(screenshot_path)
+                                    await self.push_remote_log(f"Screenshot captured ({size} bytes) and uploaded to Dashboard.")
+                                    self.pending_screenshot = screenshot_path
+                                else:
+                                    await self.push_remote_log(f"Screenshot failed: {err}")
                         except Exception as e:
                             await self.push_remote_log(f"Screenshot error: {e}")
                         finally:
@@ -745,36 +813,56 @@ Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarc
 
                     elif tool == "generate_image":
                         prompt    = action.get("prompt", "")
+                        negative  = action.get("negative", "ugly, blurry, low quality, watermark, text, deformed")
                         filename  = action.get("filename", f"concept_{self.iteration}.png")
                         width     = int(action.get("width", 1024))
                         height    = int(action.get("height", 576))
                         steps     = int(action.get("steps", 25))
-                        cfg       = float(action.get("cfg", 3.5))
+                        cfg       = float(action.get("cfg", 7.0))
+                        # Filename loop guard — detect >3 consecutive generates of the same file
+                        if filename == self.last_gen_filename:
+                            self.last_gen_repeat_count += 1
+                        else:
+                            self.last_gen_filename = filename
+                            self.last_gen_repeat_count = 1
+                        if self.last_gen_repeat_count >= 3:
+                            await self.push_agent_state("last_search_result",
+                                f"[GENERATE_LOOP]: You have generated '{filename}' {self.last_gen_repeat_count} times in a row. "
+                                f"Stop regenerating this file. Either: (1) accept the result and move on, "
+                                f"(2) use analyze_image to critique what you already have, or "
+                                f"(3) create a NEW file with a different descriptive name. Change approach now.")
+                            await self.push_remote_log(f"[LOOP GUARD] Blocked repeat generation #{self.last_gen_repeat_count}: {filename}")
+                            continue
+                        # Resolve model: accept Gemma's hint if it's a known SDXL/SD checkpoint; skip FLUX models
+                        _sdxl_models = {"illustriousXL_v01.safetensors", "sd_xl_base_1.0.safetensors", "epicrealismXL_pureFix.safetensors", "realvisxlV50_v50LightningBakedvae.safetensors"}
+                        _requested_model = action.get("model", "")
+                        _ckpt_dir = "/Users/max/ComfyUI/models/checkpoints/"
+                        _preferred_default = "illustriousXL_v01.safetensors" if os.path.exists(_ckpt_dir + "illustriousXL_v01.safetensors") else "sd_xl_base_1.0.safetensors"
+                        _candidate = _requested_model if _requested_model in _sdxl_models else _preferred_default
+                        model = _candidate if os.path.exists(_ckpt_dir + _candidate) else "sd_xl_base_1.0.safetensors"
                         out_dir   = os.path.join(WORKSPACE_DIR, "lore", "visuals", "generated")
                         os.makedirs(out_dir, exist_ok=True)
                         out_path  = os.path.join(out_dir, filename)
-                        logger.info(f"Generating image: {filename}")
-                        await self.push_remote_log(f"Generating image via ComfyUI FLUX: {filename}")
+                        logger.info(f"Generating image: {filename} (model={model})")
+                        await self.push_remote_log(f"Generating image via ComfyUI ({model}): {filename}")
                         try:
                             import uuid as _uuid, time as _time
                             comfy_url = "http://127.0.0.1:8188"
                             client_id = str(_uuid.uuid4())
-                            # FLUX.1-dev fp8 workflow: UNETLoader + DualCLIPLoader + FluxGuidance sampler
+                            # SDXL/SD workflow: CheckpointLoaderSimple with positive + negative prompts
                             workflow = {
-                                "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev-fp8.safetensors", "weight_dtype": "fp8_e4m3fn"}},
-                                "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "t5xxl_fp8_e4m3fn.safetensors", "clip_name2": "clip_l.safetensors", "type": "flux", "model_type": "flux"}},
-                                "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
-                                "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": prompt}},
-                                "5": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-                                "6": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": cfg}},
-                                "7": {"class_type": "KSampler", "inputs": {
-                                    "model": ["1", 0], "positive": ["6", 0], "negative": ["4", 0],
-                                    "latent_image": ["5", 0], "seed": self.iteration,
-                                    "steps": steps, "cfg": 1.0, "sampler_name": "euler",
-                                    "scheduler": "simple", "denoise": 1.0
+                                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model}},
+                                "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": prompt}},
+                                "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": negative}},
+                                "4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+                                "5": {"class_type": "KSampler", "inputs": {
+                                    "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
+                                    "latent_image": ["4", 0], "seed": self.iteration,
+                                    "steps": steps, "cfg": cfg, "sampler_name": "euler",
+                                    "scheduler": "karras", "denoise": 1.0
                                 }},
-                                "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
-                                "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": os.path.splitext(filename)[0]}},
+                                "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+                                "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": os.path.splitext(filename)[0]}},
                             }
                             async with aiohttp.ClientSession() as sess:
                                 resp = await sess.post(f"{comfy_url}/prompt", json={"prompt": workflow, "client_id": client_id})

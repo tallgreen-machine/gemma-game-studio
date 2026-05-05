@@ -31,6 +31,14 @@ async def init_db(app):
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS screenshot_history (
+                    id SERIAL PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    label TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
         logger.info("Database connection pool established and tables verified.")
     except Exception as e:
         logger.error(f"Failed to connect to DB: {e}")
@@ -164,12 +172,30 @@ async def api_push_screenshot(request):
         f.write(image_data)
         
     url = f"/media/{filename}"
-    
+
+    # Persist to DB
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO screenshot_history (url, label) VALUES ($1, $2)",
+                url, label
+            )
+
     # Broadcast to WebSockets
     for ws in connected_clients:
         await ws.send_json({"type": "screenshot", "url": url, "name": label})
         
     return web.json_response({"status": "ok", "url": url})
+
+async def api_get_screenshots(request):
+    """Return the last 200 screenshots for replay on page load."""
+    if not db_pool: return web.json_response({"screenshots": []})
+    async with db_pool.acquire() as conn:
+        records = await conn.fetch(
+            "SELECT url, label, EXTRACT(EPOCH FROM created_at)*1000 AS ts FROM screenshot_history ORDER BY id DESC LIMIT 200"
+        )
+    shots = [{"url": r["url"], "name": r["label"] or "", "timestamp": int(r["ts"])} for r in reversed(records)]
+    return web.json_response({"screenshots": shots})
 
 async def api_get_state(request):
     """Get entire agent_state table."""
@@ -261,6 +287,7 @@ app.add_routes([
     web.post('/api/chat/human', api_push_human_message),
     web.post('/api/chat/response', api_push_chat_response),
     web.post('/api/screenshot', api_push_screenshot),
+    web.get('/api/screenshots', api_get_screenshots),
     web.get('/api/state', api_get_state),
     web.post('/api/state', api_update_state),
     web.get('/api/reminders', api_get_reminders),

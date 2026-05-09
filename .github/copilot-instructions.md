@@ -25,6 +25,19 @@ Before writing anything to `human_feedback.md` or posting to `/api/chat/response
 **Never edit game code directly.**
 Files under `game_workspace/src/` are Gemma's domain. If they are broken, the right response is to improve the tools or feedback loop so Gemma can fix them, not to fix them myself.
 
+**When the agent is stuck, improve the agent — never bypass it.**
+If Gemma is looping, failing to fix errors, or producing bad output, the answer is always one of:
+- Improve `supervisor.py` — better prompting, smarter triage, stronger trivial-fix logic, clearer feedback signals
+- Improve the REPAIR/BUILD loop — add deterministic pre-processing so Gemma gets solvable problems
+- Improve context assembly — give Gemma the right information in the right format
+
+It is never acceptable to:
+- Read game source files to understand "what's wrong" and then fix them myself
+- Diagnose TypeScript errors in `game_workspace/src/` and patch them directly
+- Take any shortcut that removes the agent from the loop
+
+The question is always: **how do I make the agent better at solving this class of problem?** Not: **what is the fastest way to fix this file?**
+
 ---
 
 An autonomous AI game developer loop. Gemma (Google Gemma 4 via Vertex AI) runs

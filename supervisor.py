@@ -1,1273 +1,2048 @@
+# =============================================================================
+# Gemma Game Studio — supervisor.py v2
+# Reusable autonomous game development agent framework.
+#
+# Modes (state machine):
+#   BOOTSTRAP  → Interactive intake → brief.md + manifest.json
+#   CREATIVE   → Autonomous world-building, lore, art direction
+#   ARCHITECT  → One-shot: Gemma designs task_queue.md from brief + specs
+#   BUILD      → Two-turn loop: PLAN turn → EXECUTE turn per task
+#   REPAIR     → Structured Autonomous Repair (SAR): deterministic triage + LLM rewrite
+#   PLAYTEST   → Screenshot feedback → new tasks back into queue
+#
+# Memory (file-based, version-controlled in game_workspace/agent/):
+#   brief.md        — creative north star (from BOOTSTRAP)
+#   manifest.json   — technical config + current mode (source of truth)
+#   task_queue.md   — ordered task list (from ARCHITECT, updated by BUILD)
+#   journal.md      — decision log, appended after each completed task
+#   plan.md         — current PLAN turn output (consumed by EXECUTE turn)
+#
+# DB (crash recovery only — 5 keys max):
+#   mode, iteration_count, pre_repair_mode, repair_retries, last_build_result
+# =============================================================================
+
 import asyncio
 import aiohttp
 import json
-import subprocess
 import os
+import re
+import subprocess
 import sys
+import signal
 import logging
+import datetime
+import atexit
 from ddgs import DDGS
-import chromadb
-import uuid
 
-# Setup Logging
+# ── Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("GemmaSupervisor")
 
-# Configuration
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "gemma4:31b"
-WORKSPACE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "game_workspace"))
-MANIFESTO_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "manifesto.md"))
-JOURNAL_PATH = os.path.join(WORKSPACE_DIR, "journal.md")
-FEEDBACK_PATH = os.path.join(os.path.dirname(__file__), "human_feedback.md")
-DROPLET_SSH = "epiphany"  # Used for rsync over SSH
-DROPLET_IP = "165.227.27.71" # Used for HTTP API calls
-MAX_FAILURES = 5
+# ── Config
+ROOT_DIR      = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE_DIR = os.path.join(ROOT_DIR, "game_workspace")
+AGENT_DIR     = os.path.join(WORKSPACE_DIR, "agent")
+FEEDBACK_PATH = os.path.join(ROOT_DIR, "human_feedback.md")
+PID_FILE      = os.path.join(ROOT_DIR, "supervisor.pid")
+
+OLLAMA_URL    = "http://localhost:11434/api/generate"
+MODEL_NAME    = "gemma4:31b"
+DROPLET_IP    = "165.227.27.71"
+API_KEY       = "epiphany_secret_2026"
+
+# Agent memory paths
+BRIEF_PATH      = os.path.join(AGENT_DIR, "brief.md")
+MANIFEST_PATH   = os.path.join(AGENT_DIR, "manifest.json")
+TASK_QUEUE_PATH = os.path.join(AGENT_DIR, "task_queue.md")
+JOURNAL_PATH    = os.path.join(AGENT_DIR, "journal.md")
+PLAN_PATH           = os.path.join(AGENT_DIR, "plan.md")
+REPAIR_RETRIES_PATH = os.path.join(AGENT_DIR, "repair_retries.json")
+LAST_OUTPUT_PATH    = os.path.join(AGENT_DIR, "last_output.txt")
+
+MAX_RETRIES = 5  # attempts per file before marking it stuck
+
+
+# =============================================================================
+# SAR Engine — pure functions, no class state needed
+# =============================================================================
+
+def parse_ts_errors(tsc_output: str) -> dict:
+    """Parse `tsc --noEmit` output into {rel_path: [error_dict]} map."""
+    errors = {}
+    pattern = re.compile(r'^(.+?\.tsx?)\((\d+),(\d+)\): error (TS\d+): (.+)$')
+    for line in tsc_output.splitlines():
+        m = pattern.match(line.strip())
+        if m:
+            path, ln, col, code, msg = m.groups()
+            rel = path
+            for prefix in [WORKSPACE_DIR + '/', WORKSPACE_DIR + os.sep, './']:
+                if rel.startswith(prefix):
+                    rel = rel[len(prefix):]
+                    break
+            errors.setdefault(rel, []).append({
+                'line': int(ln), 'col': int(col), 'code': code, 'message': msg.strip()
+            })
+    return errors
+
+
+def resolve_imports(filepath: str) -> list:
+    """Extract resolved .ts paths from import statements in a TypeScript file."""
+    full = os.path.join(WORKSPACE_DIR, filepath)
+    if not os.path.exists(full):
+        return []
+    try:
+        content = open(full).read()
+    except Exception:
+        return []
+    base_dir = os.path.dirname(filepath)
+    results = []
+    for m in re.finditer(r"""from\s+['"]([./][^'"]+)['"]""", content):
+        raw = m.group(1)
+        resolved = os.path.normpath(os.path.join(base_dir, raw)).replace('\\', '/')
+        for candidate in [resolved + '.ts', resolved + '/index.ts']:
+            if os.path.exists(os.path.join(WORKSPACE_DIR, candidate)):
+                results.append(candidate)
+                break
+    return results
+
+
+def build_repair_order(error_map: dict) -> list:
+    """Return files sorted: imported-by-others first (unblock more), then error count desc."""
+    files = set(error_map.keys())
+    imported_by_errored = set()
+    for f in files:
+        for imp in resolve_imports(f):
+            if imp in files:
+                imported_by_errored.add(imp)
+    return sorted(files, key=lambda f: (0 if f in imported_by_errored else 1, -len(error_map[f])))
+
+
+TRIVIAL_CODES = {'TS2551', 'TS2552', 'TS2564', 'TS7006', 'TS2307', 'TS2724'}
+
+
+def _find_module_in_workspace(import_spec: str) -> str | None:
+    """Given a relative import like '../types' or './WorldState', find the actual .ts file in WORKSPACE_DIR."""
+    # Strip leading ./
+    name = import_spec.lstrip('./').split('/')[-1]
+    # Walk the workspace src tree looking for a matching filename
+    for root, _, files in os.walk(os.path.join(WORKSPACE_DIR, "src")):
+        for f in files:
+            if f == name + '.ts' or f == name + '.d.ts':
+                return os.path.join(root, f)
+    return None
+
+
+def attempt_trivial_fixes(filepath: str, errors: list) -> tuple:
+    """Auto-fix trivial errors in place. Returns (changed: bool, new_content: str)."""
+    full = os.path.join(WORKSPACE_DIR, filepath)
+    try:
+        lines = open(full).readlines()
+    except Exception:
+        return False, ""
+
+    changed = False
+    for err in errors:
+        if err['code'] not in TRIVIAL_CODES:
+            continue
+        li = err['line'] - 1
+        if li < 0 or li >= len(lines):
+            continue
+        line = lines[li]
+
+        if err['code'] == 'TS2551':
+            bad_m  = re.search(r"Property '(\w+)' does not exist", err['message'])
+            good_m = re.search(r"Did you mean '(\w+)'\?", err['message'])
+            if bad_m and good_m and bad_m.group(1) != good_m.group(1):
+                new_line = line.replace(bad_m.group(1), good_m.group(1), 1)
+                if new_line != line:
+                    lines[li] = new_line
+                    changed = True
+
+        elif err['code'] == 'TS2564':
+            prop_m = re.search(r"Property '(\w+)'", err['message'])
+            if prop_m:
+                pname = prop_m.group(1)
+                new_line = re.sub(r'(\b' + re.escape(pname) + r'\b)(\s*[?]?\s*:)', r'\1!\2', line, count=1)
+                if new_line != line:
+                    lines[li] = new_line
+                    changed = True
+
+        elif err['code'] == 'TS7006':
+            param_m = re.search(r"Parameter '(\w+)' implicitly", err['message'])
+            if param_m:
+                pname = param_m.group(1)
+                new_line = re.sub(r'(\b' + re.escape(pname) + r'\b)(\s*[,){])', r'\1: any\2', line, count=1)
+                if new_line != line:
+                    lines[li] = new_line
+                    changed = True
+
+        elif err['code'] == 'TS2552':
+            # "Cannot find name 'X'. Did you mean 'Y'?" — rename ALL occurrences in file
+            bad_m  = re.search(r"Cannot find name '(\w+)'", err['message'])
+            good_m = re.search(r"Did you mean '(\w+)'\?", err['message'])
+            if bad_m and good_m and bad_m.group(1) != good_m.group(1):
+                new_content = re.sub(r'\b' + re.escape(bad_m.group(1)) + r'\b', good_m.group(1), ''.join(lines))
+                if new_content != ''.join(lines):
+                    lines = list(new_content)  # will be rejoined at end
+                    lines = [new_content]  # treat as single string for return
+                    changed = True
+                    break  # re.sub already handled all lines
+
+        elif err['code'] == 'TS2724':
+            # "'module' has no exported member named 'X'. Did you mean 'Y'?" — rename ALL occurrences
+            bad_m  = re.search(r"has no exported member named '(\w+)'", err['message'])
+            good_m = re.search(r"Did you mean '(\w+)'\?", err['message'])
+            if bad_m and good_m and bad_m.group(1) != good_m.group(1):
+                new_content = re.sub(r'\b' + re.escape(bad_m.group(1)) + r'\b', good_m.group(1), ''.join(lines))
+                if new_content != ''.join(lines):
+                    lines = [new_content]
+                    changed = True
+                    break
+
+        elif err['code'] == 'TS2307':
+            # "Cannot find module 'X' or its corresponding type declarations."
+            mod_m = re.search(r"Cannot find module '([^']+)'", err['message'])
+            if mod_m:
+                bad_import = mod_m.group(1)
+                # Only fix relative imports (starts with . or ..)
+                if bad_import.startswith('.'):
+                    # Try to find the actual file on disk
+                    actual_path = _find_module_in_workspace(bad_import)
+                    if actual_path:
+                        file_dir = os.path.dirname(os.path.join(WORKSPACE_DIR, filepath))
+                        rel = os.path.relpath(actual_path.replace('.ts', ''), file_dir).replace(os.sep, '/')
+                        if not rel.startswith('.'):
+                            rel = './' + rel
+                        new_line = line.replace(f"'{bad_import}'", f"'{rel}'", 1)
+                        new_line = new_line.replace(f'"{bad_import}"', f'"{rel}"', 1)
+                        if new_line != line:
+                            lines[li] = new_line
+                            changed = True
+
+    result = lines[0] if len(lines) == 1 and isinstance(lines[0], str) and '\n' in lines[0] else ''.join(lines)
+    return changed, result
+
+
+# Mapping of source files to their design spec documents
+SPEC_MAP = {
+    'src/client/core/CoreEngine.ts':                    'specs/CoreEngine.md',
+    'src/client/core/systems/DialogueSystem.ts':        'specs/systems/DialogueSystem.md',
+    'src/client/core/systems/LLMEngine.ts':             'specs/systems/LLMEngine.md',
+    'src/client/core/systems/MovementSystem.ts':        'specs/systems/MovementSystem_SideScrolling.md',
+    'src/client/core/systems/CameraSystem.ts':          'specs/systems/CameraSystem.md',
+    'src/client/core/systems/InputSystem.ts':           'specs/systems/InputSystem.md',
+    'src/client/core/systems/InteractionSystem.ts':     'specs/systems/InteractionSystem.md',
+    'src/client/core/systems/QuestSystem.ts':           'specs/systems/QuestSystem.md',
+    'src/client/core/systems/RenderSystem.ts':          'specs/systems/RenderSystem.md',
+    'src/client/core/systems/WorldSystem.ts':           'specs/systems/WorldSystem.md',
+    'src/client/ui/DialogueUI.ts':                      'specs/DialogueUI.spec.md',
+    'src/client/state/GameState.ts':                    'specs/gamestate_spec.md',
+    'src/server/GameServer.ts':                         'specs/server/GameServer.md',
+}
+
+
+def find_spec_for_file(source_file: str) -> str | None:
+    """Return the spec markdown content for a given source file, if available."""
+    spec_rel = SPEC_MAP.get(source_file)
+    if not spec_rel:
+        base = os.path.splitext(os.path.basename(source_file))[0].lower()
+        for root, _, files in os.walk(os.path.join(WORKSPACE_DIR, 'specs')):
+            for f in files:
+                if f.lower().startswith(base) and f.endswith('.md'):
+                    spec_rel = os.path.relpath(os.path.join(root, f), WORKSPACE_DIR)
+                    break
+            if spec_rel:
+                break
+    if not spec_rel:
+        return None
+    full = os.path.join(WORKSPACE_DIR, spec_rel)
+    return open(full).read() if os.path.exists(full) else None
+
+
+def assemble_nuke_prompt(target_file: str, errors: list, brief: str) -> str:
+    """Build a 'rewrite from spec' prompt for files that have resisted incremental repair."""
+    spec_content = find_spec_for_file(target_file)
+    full_path = os.path.join(WORKSPACE_DIR, target_file)
+    original = open(full_path).read() if os.path.exists(full_path) else ''
+    orig_exports = re.findall(r'export\s+(?:class|interface|type|enum|function|const)\s+(\w+)', original)
+    error_block = '\n'.join(f'  Line {e["line"]}: [{e["code"]}] {e["message"]}' for e in errors)
+    exports_block = '\n'.join(f'  export {e}' for e in orig_exports) if orig_exports else '  (none detected — infer from spec)'
+    return (
+        'You are a TypeScript expert. Incremental patching has failed on this file.\n'
+        'Rewrite it COMPLETELY FROM SCRATCH — discard the current implementation, start fresh.\n\n'
+        f'FILE TO REWRITE: {target_file}\n\n'
+        f'REQUIRED EXPORTS (must ALL be present in your output):\n{exports_block}\n\n'
+        + (f'DESIGN SPEC (source of truth for behaviour):\n{spec_content[:3500]}\n\n' if spec_content else '')
+        + f'COMPILE ERRORS IN CURRENT BROKEN VERSION (context only — do not patch, rewrite):\n{error_block}\n\n'
+        + f'GAME CONTEXT: {brief[:300]}\n\n'
+        + 'OUTPUT RULES:\n'
+        + '- Respond with ONLY a ```typescript ... ``` code fence\n'
+        + '- No explanation, no commentary, no text outside the fence\n'
+        + '- Complete, compilable TypeScript — prioritise correctness over completeness\n'
+        + '- Preserve all required exports listed above\n'
+        + '- Only import from paths that exist in the codebase\n'
+    )
+
+
+def assemble_task_card(target_file: str, errors: list, context_files: dict, brief: str, retry: int = 0, previous_new_errors: dict = None, full_tsc_output: str = None) -> str:
+    """Build the complete task card prompt for Gemma in REPAIR mode."""
+    error_block = "\n".join(
+        f"  Line {e['line']}: [{e['code']}] {e['message']}" for e in errors
+    )
+    context_block = "\n".join(
+        "\n" + "=" * 60 + f"\nCONTEXT (read-only): {path}\n" + "=" * 60 + f"\n{content}"
+        for path, content in context_files.items()
+        if path != target_file
+    )
+    target_content = context_files.get(target_file, "(file not found)")
+
+    if retry == 0:
+        retry_note = ""
+    elif previous_new_errors:
+        # Tell Gemma exactly what new errors her last attempt introduced
+        new_err_lines = []
+        for f, errs in previous_new_errors.items():
+            for e in errs:
+                new_err_lines.append(f"  {f}({e['line']}): [{e['code']}] {e['message']}")
+        retry_note = (
+            f"\n⚠️ RETRY {retry}: Your previous rewrite INTRODUCED {sum(len(v) for v in previous_new_errors.values())} NEW ERRORS:\n"
+            + "\n".join(new_err_lines[:20]) + "\n"
+            + "Fix the original errors WITHOUT introducing any of the above new ones.\n"
+            + "Pay close attention to import paths and type compatibility.\n"
+        )
+    else:
+        retry_note = (
+            f"\n⚠️ RETRY {retry}: Your previous response contained NO CODE BLOCK. "
+            "BEGIN YOUR RESPONSE IMMEDIATELY WITH ```typescript and nothing else.\n"
+        )
+
+    # On retry, show the full compiler output so Gemma has the same view a developer would
+    tsc_block = ""
+    if retry >= 1 and full_tsc_output:
+        tsc_block = (
+            "\nFULL COMPILER OUTPUT (all files — same output as running `npx tsc --noEmit`):\n"
+            + "```\n" + full_tsc_output[:3000] + ("\n...[TRUNCATED]" if len(full_tsc_output) > 3000 else "") + "\n```\n"
+        )
+
+    return (
+        "You are a TypeScript expert fixing compile errors in a PixiJS game.\n"
+        + retry_note
+        + tsc_block
+        + f"\nTASK: Rewrite `{target_file}` to fix all {len(errors)} errors listed below.\n"
+        + f"\nERRORS TO FIX:\n{error_block}\n"
+        + f"\nCONTEXT FILES (read-only):\n{context_block if context_block else '(none)'}\n"
+        + f"\nFILE TO REWRITE:\n{'='*60}\n{target_file}\n{'='*60}\n{target_content}\n"
+        + f"\nGAME CONTEXT: {brief[:400] if brief else 'A sci-fi RPG built with TypeScript and PixiJS.'}\n"
+        + "\nOUTPUT RULES:\n"
+        + "- Respond with ONLY a ```typescript ... ``` code fence\n"
+        + "- No explanation, no commentary, no other text outside the fence\n"
+        + "- Preserve all existing exports and functionality\n"
+        + "- Do not add imports for modules not in the codebase\n"
+    )
+
+
+def lookup_conflicting_type_hints(target_file: str, errors: list) -> str:
+    """For TS2416 errors (type not assignable), find all competing definitions
+    of the same type name in the workspace and inject them so Gemma can resolve."""
+    hints = []
+    for e in errors:
+        if e['code'] not in ('TS2416', 'TS2345', 'TS2322'):
+            continue
+        # Extract the type name from the error message
+        type_m = re.search(r"type '([A-Z][\w]+)'", e['message'])
+        if not type_m:
+            continue
+        type_name = type_m.group(1)
+        # Find all .ts files that export this type
+        definitions = []
+        for root, _, files in os.walk(os.path.join(WORKSPACE_DIR, 'src')):
+            for f in files:
+                if not f.endswith('.ts'):
+                    continue
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, WORKSPACE_DIR).replace(os.sep, '/')
+                if rel == target_file:
+                    continue
+                try:
+                    content = open(full).read()
+                except Exception:
+                    continue
+                # Look for an export of this exact type name
+                if re.search(r'export\s+(?:interface|class|type|enum)\s+' + re.escape(type_name) + r'\b', content):
+                    # Extract the type definition block (up to 40 lines)
+                    m = re.search(
+                        r'export\s+(?:interface|class|type|enum)\s+' + re.escape(type_name) + r'\b[^{]*\{',
+                        content)
+                    if m:
+                        block = '\n'.join(content[m.start():m.start()+3000].splitlines()[:40])
+                        definitions.append((rel, block))
+        if len(definitions) >= 2:
+            hint_block = f"\n⚠️ TYPE CONFLICT: '{type_name}' is defined in multiple files:\n"
+            for rel, block in definitions:
+                hint_block += f"\n--- {rel} ---\n{block}\n...(truncated)\n"
+            # Find which one GameSystem (or the base class) uses
+            gamesystem_path = 'src/client/core/systems/GameSystem.ts'
+            full_gs = os.path.join(WORKSPACE_DIR, gamesystem_path)
+            if os.path.exists(full_gs):
+                gs_content = open(full_gs).read()
+                for rel, _ in definitions:
+                    if rel in gs_content or rel.replace('/', "'") in gs_content:
+                        hint_block += f"\n✅ GameSystem imports '{type_name}' from '{rel}' — use THIS import path.\n"
+                        break
+                else:
+                    # Check which import path GameSystem actually uses
+                    imp_m = re.search(r"from '([^']+(?:GameState|types)[^']*)'"  , gs_content)
+                    if imp_m:
+                        hint_block += f"\n✅ GameSystem imports from '{imp_m.group(1)}' — use THIS import path.\n"
+            hints.append(hint_block)
+    return '\n'.join(hints)
+
+
+def lookup_pixi_type_hints(errors: list) -> str:
+    """For TS2339 'property does not exist on type X' errors, find the actual
+    PixiJS type definition and return it as a hint block for Gemma."""
+    # Extract unique type names from TS2339 errors
+    type_names = set()
+    for e in errors:
+        if e['code'] == 'TS2339':
+            m = re.search(r"does not exist on type '([^']+)'", e['message'])
+            if m:
+                # Strip generic params: ColorMatrixFilter<X> -> ColorMatrixFilter
+                type_names.add(re.sub(r'<.*>', '', m.group(1)).strip())
+
+    if not type_names:
+        return ""
+
+    pixi_dts = os.path.join(WORKSPACE_DIR, "node_modules", "pixi.js", "dist", "pixi.js.d.ts")
+    if not os.path.exists(pixi_dts):
+        return ""
+
+    try:
+        dts_content = open(pixi_dts).read()
+    except Exception:
+        return ""
+
+    hints = []
+    for type_name in sorted(type_names):
+        # Find the class/interface declaration
+        m = re.search(
+            r'(?:export\s+)?(?:declare\s+)?(?:class|interface)\s+' + re.escape(type_name) + r'\b[^{]*\{',
+            dts_content
+        )
+        if not m:
+            continue
+        start = m.start()
+        # Extract up to 60 lines of the declaration
+        block_lines = dts_content[start:start + 4000].splitlines()[:60]
+        block = '\n'.join(block_lines)
+        hints.append(f"// PixiJS type definition for {type_name}:\n{block}\n// ... (see full definition in node_modules)")
+
+    return ("\nPIXIJS TYPE REFERENCE (use these exact method/property names):\n"
+            + "\n\n".join(hints) + "\n") if hints else ""
+
+
+def extract_code_block(response: str) -> str:
+    """Extract TypeScript content from a fenced code block."""
+    # Try any language-tagged fence (typescript, ts, javascript, js, tsx, jsx, ...)
+    m = re.search(r'```(?:[a-zA-Z]+)\n(.*?)```', response, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Try plain fence
+    m = re.search(r'```\n(.*?)```', response, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Opening fence but truncated before closing (output was cut off)
+    m = re.search(r'```(?:[a-zA-Z]*)\n(.*)', response, re.DOTALL)
+    if m:
+        code = m.group(1).strip()
+        if len(code) > 50:
+            return code
+    # Scan for TypeScript code anywhere in the response (Gemma wrote prose before code)
+    ts_keywords = ('import ', 'export ', 'class ', 'const ', 'interface ', 'type ', '//', '/*')
+    lines = response.strip().splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith(ts_keywords):
+            code = '\n'.join(lines[i:]).strip()
+            # Strip trailing fence or prose after closing fence
+            code = re.sub(r'\n```[\s\S]*$', '', code)
+            if len(code) > 50:
+                return code
+    return ""
+
+
+# =============================================================================
+# GemmaSupervisor
+# =============================================================================
 
 class GemmaSupervisor:
+
     def __init__(self):
-        self.failures = 0
         self.iteration = 0
         self.ddgs = DDGS()
-        self.action_history = [] # Track last few actions to detect loops
-        self.cognitive_history = [] # Track last few thoughts/results for context
-        self.pending_screenshot = None  # Path to screenshot to include in next prompt
-        self.last_gen_filename = None   # Loop guard: track repeated generate_image filenames
-        self.last_gen_repeat_count = 0
-        self.last_build_error_count = None  # For delta tracking across builds
-        self.consecutive_build_count = 0    # How many run_builds in a row with no create_file
-        self.scratchpad = ""               # Gemma's persistent working memory
-        self.last_build_error_count = None  # For delta tracking across builds
-        self.consecutive_build_count = 0    # How many run_builds in a row with no create_file
-        self.scratchpad = ""               # Gemma's persistent working memory, always injected
-        
-        # Init ChromaDB
-        self.chroma_client = chromadb.PersistentClient(path=os.path.join(os.path.dirname(__file__), "chroma_db"))
-        self.collection = self.chroma_client.get_or_create_collection(name="gemma_codebase")
-        
-    async def initialize_workspace(self):
-        logger.info("Initializing Workspace Natively...")
-        os.makedirs(WORKSPACE_DIR, exist_ok=True)
-        
-        # Ensure feedback file exists
-        if not os.path.exists(FEEDBACK_PATH):
-            with open(FEEDBACK_PATH, "w") as f:
-                f.write("<!-- Write your feedback or ideas here. The agent will read this on the next loop and then clear the file. -->\n")
-        
-        # Init Git
-        subprocess.run(["git", "init"], cwd=WORKSPACE_DIR, capture_output=True)
-        logger.info("Workspace initialized successfully.")
+        self._shutdown = False
 
-    def deploy_to_droplet(self):
-        """Deploys the workspace to the DO Droplet via rsync"""
-        logger.info(f"Deploying to Droplet ({DROPLET_SSH})...")
-        rsync_cmd = [
-            "rsync", "-avz", "--exclude", "node_modules", "--exclude", ".git", 
-            f"{WORKSPACE_DIR}/", f"{DROPLET_SSH}:/opt/gemma_game/"
-        ]
-        result = subprocess.run(rsync_cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            logger.info("Deployment successful.")
-        else:
-            logger.error(f"Deployment failed: {result.stderr}")
+    # ── Signals ───────────────────────────────────────────────────────────────
 
-    async def execute_native(self, command: str):
-        """Executes a command natively on the Mac within the workspace directory with a timeout."""
+    def setup_signals(self):
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
+    def _handle_signal(self, signum, frame):
+        logger.info(f"Caught signal {signum}, shutting down cleanly.")
+        self._shutdown = True
+
+    # ── Core infrastructure ───────────────────────────────────────────────────
+
+    async def execute_native(self, command: str, timeout: int = 60) -> tuple:
         process = await asyncio.create_subprocess_shell(
-            command,
-            cwd=WORKSPACE_DIR,
+            command, cwd=WORKSPACE_DIR,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             preexec_fn=os.setsid
         )
-        
         try:
-            # Wait for 60 seconds max
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
             return process.returncode, stdout.decode(), stderr.decode()
         except asyncio.TimeoutError:
             try:
                 os.killpg(os.getpgid(process.pid), 9)
             except Exception:
                 process.kill()
-            return 1, "", "Command timed out after 60 seconds. Do NOT run interactive or watching commands."
+            return 1, "", f"Command timed out after {timeout}s."
 
-    def search_web(self, query: str, max_results=3):
-        try:
-            results = list(self.ddgs.text(query, max_results=max_results))
-            return json.dumps(results)
-        except Exception as e:
-            return f"Search Error: {str(e)}"
-
-    def index_codebase(self):
-        """Reads all supported text files in WORKSPACE_DIR and upserts them to ChromaDB."""
-        logger.info("Indexing codebase into ChromaDB...")
-        valid_exts = {".ts", ".js", ".json", ".css", ".html", ".md"}
-        docs = []
-        ids = []
-        metadatas = []
-        
-        for root, _, files in os.walk(WORKSPACE_DIR):
-            if "node_modules" in root or ".git" in root:
-                continue
-            for file in files:
-                ext = os.path.splitext(file)[1]
-                if ext in valid_exts:
-                    filepath = os.path.join(root, file)
-                    try:
-                        with open(filepath, "r", encoding="utf-8") as f:
-                            content = f.read()
-                        
-                        # Use filepath as the unique ID for upsert (overwrites existing if changed)
-                        ids.append(filepath)
-                        docs.append(content)
-                        metadatas.append({"filename": file, "path": filepath})
-                    except Exception:
-                        pass
-                        
-        if docs:
-            # Upsert into Chroma. It handles tokenization and default embeddings (all-MiniLM-L6-v2) automatically.
-            self.collection.upsert(
-                documents=docs,
-                metadatas=metadatas,
-                ids=ids
-            )
-            logger.info(f"Indexed {len(docs)} files into ChromaDB.")
-
-    async def prompt_gemma(self, prompt: str, image_path: str = None) -> str:
+    async def prompt_gemma(self, prompt: str, image_path: str = None, temperature: float = 0.7, json_mode: bool = False, max_tokens: int = 4096) -> str:
         import base64
         payload = {
             "model": MODEL_NAME,
             "prompt": prompt,
             "stream": False,
             "options": {
-                "num_ctx": 8192,
-                "num_predict": 2048,
-                "temperature": 0.7,
+                "num_ctx": 32768,
+                "num_predict": max_tokens,
+                "temperature": temperature,
                 "top_p": 0.9,
                 "stop": ["Observation:"]
             }
         }
+        if json_mode:
+            payload["format"] = "json"
         if image_path and os.path.exists(image_path):
             try:
                 with open(image_path, "rb") as f:
-                    payload["images"] = [base64.b64encode(f.read()).decode("utf-8")]
-                logger.info(f"Attaching screenshot to prompt: {image_path}")
+                    payload["images"] = [base64.b64encode(f.read()).decode()]
             except Exception as e:
-                logger.warning(f"Could not encode screenshot: {e}")
+                logger.warning(f"Could not encode image: {e}")
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.post(OLLAMA_URL, json=payload, timeout=600) as response:
+                async with session.post(
+                    OLLAMA_URL, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=600)
+                ) as response:
                     if response.status == 200:
-                        data = await response.json()
-                        return data.get("response", "")
-                    else:
-                        logger.error(f"Ollama API Error: {response.status}")
-                        return ""
+                        return (await response.json()).get("response", "")
+                    logger.error(f"Ollama error: {response.status}")
             except Exception as e:
-                logger.error(f"Connection error to Ollama: {str(e)}")
-                # If we timeout, it might be a memory lock. Try a proactive kill.
+                logger.error(f"Ollama connection error: {e}")
                 if "timeout" in str(e).lower() or not str(e):
-                    logger.warning("Potential Memory Lock detected. Flushing Ollama...")
+                    logger.warning("Possible memory lock — flushing Ollama...")
                     subprocess.run(["pkill", "-9", "ollama"], capture_output=True)
-                    subprocess.run(["pkill", "-9", "ollama serve"], capture_output=True)
-                    subprocess.Popen(["nohup", "ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setpgrp)
-                return ""
-
-    def read_manifesto(self):
-        if os.path.exists(MANIFESTO_PATH):
-            with open(MANIFESTO_PATH, "r") as f:
-                return f.read()
+                    subprocess.Popen(["nohup", "ollama", "serve"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     preexec_fn=os.setpgrp)
         return ""
 
+    def _flush_ollama_if_needed(self):
+        if self.iteration > 0 and self.iteration % 50 == 0:
+            logger.info("Scheduled Ollama memory flush...")
+            subprocess.run(["pkill", "-9", "ollama"], capture_output=True)
+            subprocess.Popen(["nohup", "ollama", "serve"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             preexec_fn=os.setpgrp)
+
+    # ── File memory ───────────────────────────────────────────────────────────
+
+    def read_agent_file(self, path: str, default: str = "") -> str:
+        try:
+            return open(path).read()
+        except Exception:
+            return default
+
+    def write_agent_file(self, path: str, content: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(content)
+
     def append_journal(self, entry: str):
-        with open(JOURNAL_PATH, "a") as f:
-            f.write(f"\n## Iteration {self.iteration}\n{entry}\n")
+        os.makedirs(AGENT_DIR, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        with open(JOURNAL_PATH, 'a') as f:
+            f.write(f"\n---\n**{ts} — Iteration {self.iteration}**\n{entry}\n")
+
+    def read_brief(self) -> str:
+        return self.read_agent_file(BRIEF_PATH, "A game built with TypeScript and PixiJS.")
+
+    def read_manifest(self) -> dict:
+        try:
+            return json.loads(open(MANIFEST_PATH).read())
+        except Exception:
+            return {}
+
+    def write_manifest(self, data: dict):
+        self.write_agent_file(MANIFEST_PATH, json.dumps(data, indent=2))
+
+    def set_mode(self, mode: str):
+        manifest = self.read_manifest()
+        manifest["mode"] = mode
+        self.write_manifest(manifest)
+
+    # ── Git ───────────────────────────────────────────────────────────────────
 
     def git_commit(self, message: str):
         subprocess.run(["git", "add", "."], cwd=WORKSPACE_DIR, capture_output=True)
-        subprocess.run(["git", "commit", "-m", message], cwd=WORKSPACE_DIR, capture_output=True)
-        subprocess.run(["git", "push", "origin", "main"], cwd=WORKSPACE_DIR, capture_output=True)
-        
-    def git_reset(self):
-        logger.warning("Executing 5-fail Git Reset...")
-        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=WORKSPACE_DIR, capture_output=True)
-        subprocess.run(["git", "clean", "-fd"], cwd=WORKSPACE_DIR, capture_output=True)
+        result = subprocess.run(["git", "commit", "-m", message],
+                                cwd=WORKSPACE_DIR, capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info(f"Git commit: {message}")
 
-    async def fetch_chat_history(self):
-        """Polls the Droplet API for the persistent chat log."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                async with session.get(f"http://{DROPLET_IP}:8080/api/chat/history", headers=headers, timeout=5) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        history = data.get("history", [])
-                        if not history:
-                            return "No chat history."
-                        
-                        log_str = ""
-                        for msg in history[-10:]: # Only show last 10 messages to save context
-                            sender = "HUMAN" if msg["sender"] == "human" else "YOU"
-                            log_str += f"[{sender}]: {msg['message']}\n"
-                        return log_str.strip()
-        except Exception as e:
-            pass
-        return "Chat history unavailable."
+    def git_rollback_file(self, filepath: str):
+        subprocess.run(["git", "checkout", "--", filepath],
+                       cwd=WORKSPACE_DIR, capture_output=True)
+        logger.warning(f"Rolled back {filepath} to HEAD.")
 
-    async def fetch_pending_chat(self):
-        """Polls the Droplet dashboard for messages typed in the chat panel."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                async with session.get(f"http://{DROPLET_IP}:8080/api/chat/pending", headers=headers, timeout=5) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data.get("messages", [])
-        except Exception:
-            pass
-        return []
+    # ── Dashboard API ─────────────────────────────────────────────────────────
 
-    async def push_remote_chat(self, message: str):
-        """Pushes Gemma's response back to the Droplet UI."""
+    async def _api(self, method: str, endpoint: str, **kwargs) -> dict:
+        headers = {"X-API-KEY": API_KEY}
+        kwargs.setdefault("headers", {}).update(headers)
         try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                payload = {"message": message}
-                await session.post(f"http://{DROPLET_IP}:8080/api/chat/response", json=payload, headers=headers, timeout=5)
-        except Exception:
-            pass
-
-    async def push_human_message(self, message: str):
-        """Logs a human message (from human_feedback.md) to the Droplet chat history."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                payload = {"message": message}
-                await session.post(f"http://{DROPLET_IP}:8080/api/chat/human", json=payload, headers=headers, timeout=5)
-        except Exception:
-            pass
-
-    async def push_remote_log(self, log_text: str):
-        """Pushes a log line to the Droplet UI."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                payload = {"log": log_text}
-                await session.post(f"http://{DROPLET_IP}:8080/api/logs", json=payload, headers=headers, timeout=2)
-        except Exception:
-            pass
-
-    async def fetch_agent_state(self):
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                async with session.get(f"http://{DROPLET_IP}:8080/api/state", headers=headers, timeout=5) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data.get("state", {})
+            async with aiohttp.ClientSession() as s:
+                fn = getattr(s, method)
+                async with fn(f"http://{DROPLET_IP}:8080{endpoint}",
+                              timeout=aiohttp.ClientTimeout(total=5),
+                              **kwargs) as r:
+                    if r.status == 200:
+                        return await r.json()
         except Exception:
             pass
         return {}
 
-    async def fetch_reminders(self):
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                async with session.get(f"http://{DROPLET_IP}:8080/api/reminders", headers=headers, timeout=5) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data.get("reminders", [])
-        except Exception:
-            pass
-        return []
+    async def log(self, text: str):
+        logger.info(text)
+        await self._api("post", "/api/logs", json={"log": text})
 
-    async def sync_intel(self):
-        """Syncs manifesto.md and journal.md to the Droplet for the dashboard."""
-        try:
-            intel = {
-                "manifesto": os.path.join(os.path.dirname(__file__), "manifesto.md"),
-                "journal": os.path.join(os.path.dirname(__file__), "game_workspace/journal.md")
-            }
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                for name, path in intel.items():
-                    if os.path.exists(path):
-                        with open(path, 'r') as f:
-                            content = f.read()
-                        await session.post(f"http://{DROPLET_IP}:8080/api/{name}", json={"content": content}, headers=headers, timeout=5)
-        except Exception:
-            pass
+    async def push_state(self, key: str, value: str):
+        await self._api("post", "/api/state", json={"key": key, "value": value})
 
-    async def push_agent_state(self, key: str, value: str):
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                payload = {"key": key, "value": value}
-                await session.post(f"http://{DROPLET_IP}:8080/api/state", json=payload, headers=headers, timeout=5)
-        except Exception:
-            pass
+    async def fetch_state(self) -> dict:
+        return (await self._api("get", "/api/state")).get("state", {})
 
-    async def push_reminder(self, note: str):
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                payload = {"note": note}
-                await session.post(f"http://{DROPLET_IP}:8080/api/reminders", json=payload, headers=headers, timeout=5)
-        except Exception:
-            pass
+    async def set_last_output(self, text: str):
+        """Write tool output to local file (reliable) and push to dashboard (display only)."""
+        self.write_agent_file(LAST_OUTPUT_PATH, text)
+        await self.push_state("last_command_output", text)  # dashboard display only
 
-    async def push_action_log(self, tool: str, summary: str, outcome: str = "ok"):
-        """Logs a concise one-line action entry to the remote DB."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                payload = {"iteration": self.iteration, "tool": tool, "summary": summary, "outcome": outcome}
-                await session.post(f"http://{DROPLET_IP}:8080/api/action_log", json=payload, headers=headers, timeout=3)
-        except Exception:
-            pass
+    def read_last_output(self) -> str:
+        return self.read_agent_file(LAST_OUTPUT_PATH, "None")
 
-    async def fetch_action_log(self, n: int = 15) -> str:
-        """Returns last n action log rows formatted as a compact cheat-sheet string."""
+    def read_repair_retries(self) -> dict:
         try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-KEY": "epiphany_secret_2026"}
-                async with session.get(f"http://{DROPLET_IP}:8080/api/action_log?n={n}", headers=headers, timeout=5) as r:
-                    data = await r.json()
-                    entries = data.get("log", [])
-            if not entries:
-                return "No actions logged yet."
-            lines = [f"#{e['iteration']:>4} {e['tool']:<20} [{e['outcome']:>4}]  {e['summary']}" for e in entries]
-            return "\n".join(lines)
+            return json.loads(open(REPAIR_RETRIES_PATH).read())
         except Exception:
-            return "Action log unavailable."
+            return {}
+
+    def write_repair_retries(self, counts: dict):
+        self.write_agent_file(REPAIR_RETRIES_PATH, json.dumps(counts))
+
+    def clear_repair_retries(self):
+        if os.path.exists(REPAIR_RETRIES_PATH):
+            os.remove(REPAIR_RETRIES_PATH)
+
+    async def push_chat(self, message: str):
+        await self._api("post", "/api/chat/response", json={"message": message})
+
+    async def push_human_message(self, message: str):
+        await self._api("post", "/api/chat/human", json={"message": message})
+
+    async def fetch_pending_chat(self) -> list:
+        return (await self._api("get", "/api/chat/pending")).get("messages", [])
+
+    async def fetch_chat_history(self) -> str:
+        history = (await self._api("get", "/api/chat/history")).get("history", [])
+        if not history:
+            return "No chat history."
+        lines = [f"[{'HUMAN' if m['sender']=='human' else 'YOU'}]: {m['message']}" for m in history[-10:]]
+        return "\n".join(lines)
 
     async def push_screenshot(self, filepath: str):
-        """Reads a PNG file and posts the binary data to the Droplet."""
         if not os.path.exists(filepath):
             return
         try:
             with open(filepath, "rb") as f:
-                image_data = f.read()
-            original_name = os.path.basename(filepath)
-            async with aiohttp.ClientSession() as session:
-                headers = {
-                    "X-API-KEY": "epiphany_secret_2026",
-                    "Content-Type": "image/png",
-                    "X-Image-Name": original_name,
-                }
-                await session.post(f"http://{DROPLET_IP}:8080/api/screenshot", data=image_data, headers=headers, timeout=10)
+                data = f.read()
+            headers = {
+                "X-API-KEY": API_KEY,
+                "Content-Type": "image/png",
+                "X-Image-Name": os.path.basename(filepath)
+            }
+            async with aiohttp.ClientSession() as s:
+                await s.post(f"http://{DROPLET_IP}:8080/api/screenshot",
+                             data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=10))
         except Exception as e:
             logger.error(f"Failed to push screenshot: {e}")
 
-    async def run_loop(self):
-        await self.initialize_workspace()
-        manifesto = self.read_manifesto()
-        
-        # Initial RAG indexing
-        self.index_codebase()
-        
-        while True:
-            # 1. Fetch DB State
-            state = await self.fetch_agent_state()
-            
-            # Initialize iteration from DB on first boot
-            if self.iteration == 0:
-                self.iteration = int(state.get("iteration_count", 0))
-            
-            self.failures = int(state.get("consecutive_failures", self.failures))
-            current_task = state.get("current_task", "None defined.")
-            overarching_goal = state.get("overarching_goal", "None defined.")
-            last_cmd = state.get("last_command_output", "None")
-            last_build_result = state.get("last_build_result", "No build run yet.")
-            last_search = state.get("last_search_result", "None")
-            last_thought = state.get("last_thought", "None")
-            current_phase = state.get("current_phase", "CREATIVE")
+    async def push_action(self, tool: str, summary: str, outcome: str = "ok"):
+        await self._api("post", "/api/action_log",
+                        json={"iteration": self.iteration, "tool": tool,
+                              "summary": summary, "outcome": outcome})
 
-            # Fetch compact action log for TECHNICAL phase cheat-sheet
-            action_log_str = await self.fetch_action_log(15) if current_phase == "TECHNICAL" else ""
+    async def sync_intel(self):
+        for name, path in [("manifesto", BRIEF_PATH), ("journal", JOURNAL_PATH)]:
+            if os.path.exists(path):
+                content = open(path).read()
+                await self._api("post", f"/api/{name}", json={"content": content})
 
-            # Auto phase transition: if Gemma declared creative phase complete, flip to TECHNICAL
-            phase_complete_path = os.path.join(WORKSPACE_DIR, "lore", "PHASE_COMPLETE.md")
-            if current_phase == "CREATIVE" and os.path.exists(phase_complete_path):
-                logger.info("PHASE_COMPLETE.md detected — transitioning to TECHNICAL phase.")
-                await self.push_agent_state("current_phase", "TECHNICAL")
-                await self.push_remote_log("[PHASE TRANSITION] Creative phase complete. Entering TECHNICAL phase.")
-                current_phase = "TECHNICAL"
-            
-            # Fetch Reminders
-            reminders = await self.fetch_reminders()
-            reminder_text = "\n".join([f"- {r}" for r in reminders]) if reminders else "None."
-            
-            # Run Git Status
-            git_status_cmd = subprocess.run(["git", "status", "-s"], cwd=WORKSPACE_DIR, capture_output=True, text=True)
-            git_status = git_status_cmd.stdout.strip() or "Clean working tree."
-            
-            # Sync intel to dashboard
-            await self.sync_intel()
-            
-            # Re-index every 5 loops
-            if self.iteration > 0 and self.iteration % 5 == 0:
-                self.index_codebase()
-            
-            # Auto-Flush Ollama every 50 loops to clear RAM
-            if self.iteration > 0 and self.iteration % 50 == 0:
-                logger.info("Performing scheduled Memory Flush (Ollama restart)...")
-                await self.push_remote_log("Performing scheduled Memory Flush to stabilize RAM...")
-                subprocess.run(["pkill", "-9", "ollama"], capture_output=True)
-                subprocess.run(["pkill", "-9", "ollama serve"], capture_output=True)
-                subprocess.Popen(["nohup", "ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setpgrp)
-                await asyncio.sleep(10) # Give it time to boot
-                
-            log_str = f"--- Starting Iteration {self.iteration} ---"
-            logger.info(log_str)
-            await self.push_remote_log(log_str)
-            
-            # Update iteration in DB
-            await self.push_agent_state("iteration_count", str(self.iteration))
-            
-            # Fetch persistent chat history
-            chat_history_str = await self.fetch_chat_history()
-            
-            # Formulate human feedback — merge file + dashboard chat queue
-            human_feedback_str = ""
-            all_messages = []
+    async def fetch_reminders(self) -> str:
+        reminders = (await self._api("get", "/api/reminders")).get("reminders", [])
+        return "\n".join(f"- {r}" for r in reminders) if reminders else ""
 
-            # 1. Read from human_feedback.md
-            if os.path.exists(FEEDBACK_PATH):
-                with open(FEEDBACK_PATH, "r") as f:
-                    raw = f.read()
-                lines = raw.splitlines()
-                feedback_lines = [l for l in lines if not l.strip().startswith("<!--")]
-                content = "\n".join(feedback_lines).strip()
-                if content:
-                    all_messages.append(content)
-                    await self.push_human_message(content)
-                    # Clear it after reading
-                    with open(FEEDBACK_PATH, "w") as f:
-                        f.write("<!-- Write your feedback or ideas here. The agent will read this on the next loop and then clear the file. -->\n")
+    # ── Workspace init ────────────────────────────────────────────────────────
 
-            # 2. Poll dashboard chat panel queue
-            dashboard_messages = await self.fetch_pending_chat()
-            all_messages.extend(dashboard_messages)
+    async def initialize_workspace(self):
+        os.makedirs(WORKSPACE_DIR, exist_ok=True)
+        os.makedirs(AGENT_DIR, exist_ok=True)
+        if not os.path.exists(FEEDBACK_PATH):
+            open(FEEDBACK_PATH, 'w').write(
+                "<!-- Write feedback here. Agent reads and clears this each loop. -->\n")
+        subprocess.run(["git", "init"], cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "gemma@local"],
+                       cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Gemma"],
+                       cwd=WORKSPACE_DIR, capture_output=True)
+        if not os.path.exists(MANIFEST_PATH):
+            await self._migrate_existing_project()
+        logger.info("Workspace initialized.")
 
-            if all_messages:
-                combined = "\n\n".join(all_messages)
-                human_feedback_str = f"[NEW MESSAGE FROM HUMAN]\n{combined}\n"
-            
-            # Format cognitive history
-            cognitive_history_str = "\n".join(self.cognitive_history) if self.cognitive_history else "No history yet."
+    async def _migrate_existing_project(self):
+        """Create agent/ files for an existing project (v1 migration or new install)."""
+        src_dir  = os.path.join(WORKSPACE_DIR, "src")
+        lore_dir = os.path.join(WORKSPACE_DIR, "lore")
+        has_src  = os.path.exists(src_dir) and any(
+            f.endswith('.ts') for _, _, files in os.walk(src_dir) for f in files)
+        has_lore = os.path.exists(lore_dir) and bool(os.listdir(lore_dir))
 
-            # Restore scratchpad from DB if lost across restarts
-            if not self.scratchpad:
-                self.scratchpad = state.get("scratchpad", "")
-            
-            # Loop Detection Logic — only active in TECHNICAL phase
-            # In CREATIVE phase, repetitive file creation is correct behaviour (writing lore)
-            loop_warning = ""
-            if current_phase == "TECHNICAL" and len(self.action_history) >= 3:
-                last_3 = self.action_history[-3:]
-                if all(a == last_3[0] for a in last_3):
-                    loop_warning += f"\n\n[OBSERVATION] The last 3 actions were identical: '{last_3[0]}'. The result has not changed."
-                
-                # Semantic Loop Detection for Exploration Paralysis
-                tools_used = [a.split(":")[0] if ":" in a else a for a in self.action_history]
-                read_only_tools = {"run_bash", "read_file", "search_codebase", "search_web"}
-                
-                if len(tools_used) >= 4 and all(t in read_only_tools for t in tools_used[-4:]):
-                    cmd_history = " ".join(self.action_history[-4:])
-                    if ("ls" in cmd_history or "find" in cmd_history or "grep" in cmd_history or "cat" in cmd_history):
-                        loop_warning += "\n\n[OBSERVATION] The last 4 actions were all read-only (listing files, searching, reading). No files have been written recently."
+        mode = "REPAIR" if has_src else ("ARCHITECT" if has_lore else "BOOTSTRAP")
 
-            # Consecutive build observation (purely informational)
-            build_spin_note = ""
-            if current_phase == "TECHNICAL" and self.consecutive_build_count >= 3:
-                build_spin_note = f"\n\n[OBSERVATION] run_build has been called {self.consecutive_build_count} times in a row without any file being written in between."
-            
-            # Construct context window — phase-dependent
-            if current_phase == "CREATIVE":
-                system_prompt = f"""System:
-{manifesto}
+        if not os.path.exists(BRIEF_PATH):
+            manifesto_path = os.path.join(ROOT_DIR, "manifesto.md")
+            brief = open(manifesto_path).read()[:6000] if os.path.exists(manifesto_path) \
+                    else "# Khoros\nA sci-fi RPG built with TypeScript and PixiJS.\n"
+            self.write_agent_file(BRIEF_PATH, brief)
 
-[PHASE: CREATIVE — WORLD BUILDING, LORE & VISUAL DESIGN]
-You are not a programmer right now. You are the author, world-builder, and art director.
-Your purpose is to research deeply, imagine freely, and build the full creative foundation
-of this world — written lore AND visual language.
+        manifest = {
+            "name":       "Khoros",
+            "game_type":  "side_scroller",
+            "art_style":  "pixel",
+            "platform":   "browser",
+            "scope":      "indie",
+            "tech_stack": "typescript_pixijs",
+            "created_at": datetime.datetime.now().strftime("%Y-%m-%d"),
+            "mode":       mode
+        }
+        self.write_manifest(manifest)
+        logger.info(f"Migrated existing project -> mode={mode}")
 
-Creative work has two natural layers, move through both at your own pace:
-1. WRITTEN WORLD — mythology, history, factions, ecology, characters, language, cosmology.
-   Write until the world has a genuine spine. Make it specific and strange.
-2. VISUAL WORLD — once the world has shape, define how it looks. Color palettes per biome.
-   Lighting temperature and direction for key scenes. Silhouette archetypes for architecture
-   and characters. What the sky looks like at each hour. What materials feel like underfoot.
-   These go in lore/visuals/ and are as important as the written lore.
+    # ── Human feedback ────────────────────────────────────────────────────────
 
-No code. No implementation. No technical files. Only world-building and art direction.
+    def read_feedback(self) -> str:
+        if not os.path.exists(FEEDBACK_PATH):
+            return ""
+        with open(FEEDBACK_PATH) as f:
+            raw = f.read()
+        lines = [l for l in raw.splitlines() if not l.strip().startswith("<!--")]
+        content = "\n".join(lines).strip()
+        if content:
+            open(FEEDBACK_PATH, 'w').write(
+                "<!-- Write feedback here. Agent reads and clears this each loop. -->\n")
+        return content
 
-This phase ends only when YOU declare it complete by creating lore/PHASE_COMPLETE.md.
-Do not rush it — and do not leave it either. Tolkien spent years on Middle-earth,
-but he also drew maps and illustrated characters before a word of story was written.
+    # ── Mode: BOOTSTRAP ───────────────────────────────────────────────────────
 
-[THE SEEDS — YOUR STARTING ANCHORS]
-Visual seeds: Read lore/references/visual_seeds.md — it contains a detailed
-analysis of two reference images the human provided. These define the world's
-visual and emotional language. Use the analyze_image tool on any images you
-download to your lore/references/ folder.
+    async def run_bootstrap(self):
+        """Interactive intake -> brief.md + manifest.json -> enters CREATIVE."""
+        await self.log("=== BOOTSTRAP: New project intake ===")
 
-Text seed: "Everyone can see the moon. No one remembers why it's so close."
-This is the world's central mystery. Everything radiates from it.
+        questions = [
+            ("name",      "What is this game called? (working title fine)"),
+            ("game_type", "Game type? (side-scroller / top-down / first-person / other)"),
+            ("art_style", "Art style? (pixel / vector / high-res / 3D / hand-drawn)"),
+            ("platform",  "Target platform? (browser / desktop / mobile)"),
+            ("scope",     "Scope? (jam=one mechanic | indie=several systems | full=complete game)"),
+            ("seed",      "Describe the game in 2-4 sentences. Genre, tone, feel, references."),
+            ("mvp",       "What is the minimum that makes it feel like THIS game?"),
+        ]
 
-The world has no name yet. Give it one that could only belong to this world.
-
-[YOUR CREATIVE PRINCIPLES]
-- Depth over breadth. Ask "why" at every layer.
-- Research real history, mythology, astronomy, linguistics. Use search_web freely.
-- Your lore is load-bearing — zone names become scene IDs, faction aesthetics
-  become color palettes, NPC names appear in dialogue.
-- All lore goes in lore/ — organise it however feels natural to you.
-
-[STATE]
-Iteration: {self.iteration}
-Current Task: {current_task}
-Git Status: {git_status}
-
-[LAST COMMAND OUTPUT]
-{last_cmd}
-
-[LAST RESEARCH RESULT]
-{last_search}
-
-[CHAT HISTORY]
-{chat_history_str}
-
-{human_feedback_str}
-[LAST THOUGHT]
-{last_thought}
-
-[COGNITIVE HISTORY]
-{cognitive_history_str}
-{loop_warning}
-
-You are in creative iteration {self.iteration}. Think and imagine freely, then output a JSON object with your next creative action.
-
-[SECURITY BOUNDARY]:
-1. Run commands natively. CWD is the root of game_workspace. Do NOT `cd` around.
-2. Do NOT write or edit TypeScript/JavaScript source files in this phase.
-3. NEVER attempt to edit `supervisor.py`.
-
-Available tools: run_bash, create_file, read_file, chat_respond, update_state, add_reminder, analyze_image, generate_image, search_web, search_codebase.
-
-generate_image is for producing GAME ART ASSETS — not paintings or illustrations. Every image must serve a specific production purpose.
-
-ASSET TYPES (choose the right one):
-  background_layer  — parallax BG slice: width=1024, height=512. Single depth layer.
-  environment_concept — overall scene reference: width=1024, height=576.
-  character_silhouette — NPC/player shape on plain dark bg: width=512, height=512.
-  prop_sheet — objects on clean bg, multiple angles: width=768, height=512.
-
-SDXL PROMPTING RULES — use comma-separated weighted tags, NOT long sentences:
-  GOOD: "rust orange cliffside, (cyan energy vein:1.3), game concept art, side view, matte painting, silhouette"
-  BAD: "A wide cinematic shot of a cliffside bathed in cyan light under a bruised sky..."
-  Boost important tags with (tag:1.3), reduce noise with (tag:0.7).
-  Put the MOST IMPORTANT tags FIRST. Short tags score higher than prose.
-  Always specify: viewpoint (side view / front view / top-down), style (game concept art / 2D matte painting), and asset type.
-
-BEST MODEL: illustriousXL_v01.safetensors — fine-tuned for stylized illustration and game art, strong on silhouettes, flat/cel styles, and Khoros's rust+cyan palette.
-Recommended cfg: 7.5. Steps: 28. Width/height: use 1024x512 for landscape, 512x512 for portraits.
-
-generate_image usage: {{"tool": "generate_image", "prompt": "rust orange lowland plateau, (cyan energy leak:1.3), brutalist ruin silhouette, (side scroll background layer:1.2), game concept art, matte painting, atmospheric haze", "negative": "photorealistic, 3d render, blurry, soft focus, text, watermark, gradient sky", "filename": "bg_grounded_lowlands_layer1.png", "model": "illustriousXL_v01.safetensors", "width": 1024, "height": 512, "steps": 28, "cfg": 7.5}}
-Available models: illustriousXL_v01.safetensors (best for Khoros), sd_xl_base_1.0.safetensors.
-Example (Write lore): {{"thought": "write creation myth", "tool": "create_file", "filename": "lore/world/creation_myth.md", "content": "..."}}
-Example (Research): {{"thought": "research tidal locking", "tool": "search_web", "query": "tidal locking effects on planet mythology history"}}
-Example (Analyze image): {{"thought": "study visual seed", "tool": "analyze_image", "filename": "lore/references/coastal_ruins.png", "question": "What color palette and mood does this suggest?"}}
-update_state usage: {{"tool": "update_state", "current_task": "what you are doing right now", "overarching_goal": "optional high-level goal"}}
-Example (Update state): {{"thought": "pivot to style research", "tool": "update_state", "current_task": "Visual Style Decision — testing Schematic Minimalism hypothesis"}}
-Example (Read back): {{"thought": "self-critique my last work", "tool": "read_file", "filename": "lore/world/history.md"}}
-Example (Declare ready): {{"thought": "the world is ready", "tool": "create_file", "filename": "lore/PHASE_COMPLETE.md", "content": "The world is ready to build. Summary: ..."}}
-"""
-                # Creative phase procedural triggers
-                if self.iteration > 0 and self.iteration % 20 == 0:
-                    system_prompt += f"\n[CREATIVE SELF-CRITIQUE DIRECTIVE]: Before writing anything new this iteration, use read_file to re-read your most recent lore document. Identify what feels thin, generic, or contradictory. Write a brief self-critique in your thought, then deepen those areas before expanding into new territory.\n"
-
-                if self.iteration > 0 and self.iteration % 100 == 0:
-                    system_prompt += f"\n[PRESENTATION DEADLINE — ITERATION {self.iteration}]: You must create or update your curated world presentation at lore/presentations/presentation_current.md. This is written for an audience — not as notes. It should showcase the world's name, central mystery, visual language, factions, key locations, and whatever you consider most essential right now. Revise and improve it each cycle. This is your portfolio.\n"
-
-            else:
-                # TECHNICAL phase prompt
-                system_prompt = f"""System:
-{manifesto}
-
-[PHASE: TECHNICAL — BUILDING THE GAME]
-The creative foundation is laid. Now build. Every technical decision should be
-grounded in the lore in lore/. Read it when making decisions about names, colors,
-atmosphere, NPC behaviour, zone structure.
-
-[STATE]
-Iteration: {self.iteration}
-Consecutive Failures: {self.failures}/5
-Current Task: {current_task}
-Overarching Goal: {overarching_goal}
-Git Status:
-{git_status}
-
-[LAST COMMAND OUTPUT]
-{last_cmd}
-
-[LAST BUILD RESULT — persists until next run_build]
-{last_build_result}
-
-[RECENT ACTION LOG — last 15 iterations, supervisor-generated]
-Format: #iter  tool                 [outcome]  summary
-{action_log_str}
-
-[LAST RAG SEARCH RESULT]
-{last_search}
-
-[REMINDERS]
-{reminder_text}
-
-[CHAT HISTORY (Last 10 Messages)]
-{chat_history_str}
-
-{human_feedback_str}
-[LAST THOUGHT]
-{last_thought}
-
-[COGNITIVE HISTORY]
-{cognitive_history_str}
-{loop_warning}
-{build_spin_note}
-
-[SCRATCHPAD — your persistent working memory, use write_scratchpad to update]
-{self.scratchpad if self.scratchpad else '(empty — use write_scratchpad to jot hypotheses, root causes, and what you have tried)'}
-
-You are in iteration {self.iteration}. Think step-by-step, then output a JSON object with your next action.
-"""
-                # Technical phase procedural triggers
-                if self.iteration > 0 and self.iteration % 20 == 0:
-                    system_prompt += "\n[MILESTONE — Iteration #" + str(self.iteration) + "]: Consider appending a progress note to journal.md: run_bash with command: printf '\\n## Iteration " + str(self.iteration) + "\\n...' >> journal.md\n"
-
-                if "vitest" in last_cmd.lower() and "failed | 0 passed" not in last_cmd.lower() and "fail " not in last_cmd.lower():
-                    system_prompt += "\n[OBSERVATION] The last command looks like a passing test run.\n"
-
-                if self.pending_screenshot:
-                    system_prompt += """
-[VISUAL FEEDBACK — YOU CAN SEE THE GAME]
-The image attached to this prompt is a screenshot of the game running right now.
-You have vision. Analyse it critically against the Visual Art Targets below.
-Then produce ONE code change in BackgroundSystem.ts that moves the render closer to those targets.
-Do NOT just describe the image. Do NOT take a screenshot again. Write code.
-
-VISUAL ART TARGETS (from specs/visuals/VisualPipeline.md):
-- Sky occupies top 65-70% of the viewport in a smooth gradient, no visible banding
-- At least 4 distinct silhouette layers with clear depth separation
-- Ridgeline shapes: angular spires and cliff faces, NOT rounded bumps
-- Each layer filled with a gradient (lighter at ridge, darker at base) — NOT flat color
-- Foreground layer sits at 78-82% viewport height and spans full width
-- Sun/glow visible as a soft radial ellipse near horizon (not a hard disc)
-- Atmospheric haze: far layers are more blue-shifted, near layers more saturated
-- Overall mood: dramatic dusk/twilight, rich purples → orange horizon
-"""
-
-                system_prompt += """
-[SECURITY BOUNDARY]:
-1. Run commands natively. CWD is the root of the workspace. Do NOT `cd` around.
-2. ALL commands must be non-interactive (e.g. `CI=true npm test`). Never run a watch script.
-3. NEVER attempt to edit `supervisor.py`. ONLY edit workspace files.
-
-Available tools: run_bash, run_build, run_tests, create_file, read_file, write_scratchpad, chat_respond, update_state, add_reminder, capture_screenshot, search_codebase, search_web.
-
-run_build: Compiles the TypeScript project and returns errors grouped by file with a delta vs last run.
-Example: {"thought": "check for TS errors", "tool": "run_build"}
-
-run_tests: Runs the Vitest test suite and returns pass/fail results.
-Example: {"thought": "run tests", "tool": "run_tests"}
-
-write_scratchpad: Overwrite your persistent working memory (always visible in next prompt). Use to track your current hypothesis, what you have tried, and what you plan next.
-Example: {"thought": "note root cause", "tool": "write_scratchpad", "note": "Root cause: CoreEngine.ts L18 imports GameStateManager as type but it's a class. Plan: add 'typeof' or fix import."}
-
-Example (Command): {"thought": "list files", "tool": "run_bash", "command": "ls -R"}
-Example (Create File): {"thought": "write script", "tool": "create_file", "filename": "test.py", "content": "print('hello')"}
-Example (Read File): {"thought": "read script", "tool": "read_file", "filename": "test.py"}
-Example (Goal): {"thought": "Set initial goal", "tool": "update_state", "overarching_goal": "Build MMO", "current_task": "Audit files"}
-"""
-            
-            # Request action from Gemma (with optional screenshot for visual feedback)
-            screenshot_to_send = self.pending_screenshot
-            self.pending_screenshot = None  # Consume it — only used once
-            if screenshot_to_send:
-                await self.push_remote_log("Querying Gemma 4 with visual screenshot feedback...")
-                logger.info("Querying Gemma 4 with vision...")
-            else:
-                await self.push_remote_log("Querying Gemma 4 (this may take 10-30 seconds depending on load)...")
-                logger.info("Querying Gemma 4...")
-            response = await self.prompt_gemma(system_prompt, image_path=screenshot_to_send)
-            
-            await self.push_remote_log(f"Gemma 4 Output:\n{response}")
-            logger.info(f"Gemma 4 Output:\n{response}")
-            
-            if not response or len(response.strip()) < 10:
-                logger.warning("Empty or too-short response from Gemma. Nudging...")
-                await self.push_remote_log("Empty response detected. Re-prompting...")
-                await asyncio.sleep(2)
-                continue # Try the iteration again without incrementing failure
-                
-            # Basic JSON parsing and tool execution
+        answers = {}
+        print("\n" + "=" * 60)
+        print("  GEMMA GAME STUDIO — New Project")
+        print("=" * 60)
+        for key, question in questions:
+            print(f"\n{question}")
             try:
-                # Extract all JSON objects from the response; use the last one
-                # (Gemma often self-corrects by outputting a second JSON block)
-                import re as _re
-                _json_blocks = list(_re.finditer(r'\{', response))
-                action = None
-                for _m in reversed(_json_blocks):
-                    _start = _m.start()
-                    _end = response.rfind("}", _start) + 1
-                    try:
-                        action = json.loads(response[_start:_end])
-                        json_start, json_end = _start, _end
-                        break
-                    except json.JSONDecodeError:
-                        continue
-                if action is None:
-                    json_start = response.find("{")
-                    json_end = response.rfind("}") + 1
-                if json_start != -1 and json_end != 0 and action is not None:
-                    # Fallback support for hallucination patterns
-                    if "tool" not in action and "action" in action:
-                        if action["action"] in ["create_file", "write_file"]:
-                            action["tool"] = "create_file"
-                        elif action["action"] in ["chat", "chat_respond"]:
-                            action["tool"] = "chat_respond"
-                            if "text" in action and "message" not in action:
-                                action["message"] = action["text"]
-                        elif action["action"] == "run":
-                            ai = action.get("action_input", "")
-                            cmd_raw = action.get("command", ai)
-                            cmd = str(cmd_raw) if not isinstance(cmd_raw, dict) else ""
-                            # Map build commands to run_build
-                            if any(x in cmd for x in ["npm run build", "tsc", "npx tsc"]):
-                                action["tool"] = "run_build"
-                            elif any(x in cmd for x in ["vitest", "npm test", "npm run test"]):
-                                action["tool"] = "run_tests"
-                            else:
-                                action["tool"] = "run_bash"
-                                action["command"] = cmd
-                        elif action["action"] in ["bash", "execute_bash", "run_command", "run_bash", "terminal"]:
-                            action["tool"] = "run_bash"
-                            action["command"] = action.get("command", action.get("action_input", ""))
-                        elif action["action"] == "read_file":
-                            action["tool"] = "read_file"
-                            ai = action.get("action_input", "")
-                            if isinstance(ai, dict):
-                                action["filename"] = ai.get("path", ai.get("filename", ""))
-                            else:
-                                action["filename"] = str(ai)
-                        elif action["action"] == "write_to_file":
-                            action["tool"] = "create_file"
-                            ai = action.get("action_input", {})
-                            if isinstance(ai, dict):
-                                action["filename"] = ai.get("path", ai.get("filename", ""))
-                                action["content"] = ai.get("content", "")
-                        elif action["action"] == "list_directory":
-                            action["tool"] = "run_bash"
-                            ai = action.get("action_input", ".")
-                            path = ai.get("path", ".") if isinstance(ai, dict) else str(ai)
-                            action["command"] = f"ls -la {path}"
-                            
-                    tool = action.get("tool")
-                    # Normalize wrong-but-close tool names
-                    if tool in ["bash", "execute_bash", "run_command", "terminal", "execute"]:
-                        tool = "run_bash"
-                        action["tool"] = "run_bash"
-                    elif tool == "write_file":
-                        tool = "create_file"
-                        action["tool"] = "create_file"
-                    # Extract command from nested args/parameters dict
-                    if tool == "run_bash" and not isinstance(action.get("command"), str):
-                        nested = action.get("args") or action.get("parameters") or action.get("params") or {}
-                        if isinstance(nested, dict) and "command" in nested:
-                            action["command"] = nested["command"]
-                    if tool == "write_file":
-                        tool = "create_file"
-                        
-                    if tool:
-                        # Save thought to DB for next iteration
-                        thought = action.get("thought", "")
-                        if thought:
-                            await self.push_agent_state("last_thought", thought)
-                            self.cognitive_history.append(f"Iteration {self.iteration} Thought: {thought}")
+                answers[key] = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                answers[key] = ""
 
-                    if tool == "chat_respond":
-                        msg = action.get("message", action.get("content", action.get("text", "")))
-                        logger.info(f"Agent Chat: {msg}")
-                        await self.push_remote_chat(msg)
-                        await self.push_action_log("chat_respond", msg[:100], "ok")
-                        
-                    elif tool == "update_state":
-                        # Support top-level keys, 'parameters', or 'params'
-                        data = action.get("parameters") or action.get("params") or action
-                        
-                        updates = {}
-                        for k in ["overarching_goal", "current_task"]:
-                            if k in data:
-                                updates[k] = data[k]
-                        
-                        # Accept common hallucination aliases for current_task
-                        for alias in ["state", "content", "task", "description"]:
-                            if alias in data and "current_task" not in updates:
-                                updates["current_task"] = data[alias]
+        manifest = {
+            "name":       answers.get("name", "Untitled"),
+            "game_type":  answers.get("game_type", "").lower().replace(" ", "_"),
+            "art_style":  answers.get("art_style", "").lower().replace(" ", "_"),
+            "platform":   answers.get("platform", "browser"),
+            "scope":      answers.get("scope", "indie"),
+            "tech_stack": "typescript_pixijs",
+            "created_at": datetime.datetime.now().strftime("%Y-%m-%d"),
+            "mode":       "CREATIVE"
+        }
+        self.write_manifest(manifest)
 
-                        if "key" in action and "value" in action: # Legacy support
-                            updates[action["key"]] = action["value"]
-                            
-                        if not updates:
-                            logger.warning(f"update_state called but no valid keys found in: {action}")
-                        
-                        for k, v in updates.items():
-                            logger.info(f"Updating state: {k}={v}")
-                            await self.push_agent_state(k, v)
-                            await self.push_remote_log(f"State Updated: {k}={v}")
-                        if updates:
-                            await self.push_action_log("update_state", f"Updated: {list(updates.keys())}", "ok")
-                        
-                    elif tool == "add_reminder":
-                        note = action.get("note", "")
-                        logger.info(f"Adding reminder: {note}")
-                        await self.push_reminder(note)
-                        await self.push_remote_log(f"Reminder Added: {note}")
-                        await self.push_action_log("add_reminder", note[:100], "ok")
-                        
-                    elif tool == "run_build":
-                        logger.info("Running TypeScript build check...")
-                        await self.push_remote_log("Running tsc --noEmit...")
-                        code, out, err = await self.execute_native("npx tsc --noEmit 2>&1")
-                        combined = (out + err).strip()
-                        error_count = combined.count("error TS")
-                        self.consecutive_build_count += 1
-                        if code == 0 or error_count == 0:
-                            result = "[BUILD OK] TypeScript compiled with no errors."
-                            await self.push_action_log("run_build", "BUILD OK — 0 errors", "ok")
-                            self.last_build_error_count = 0
-                            self.consecutive_build_count = 0
-                        else:
-                            # Per-file error grouping
-                            import re as _re, collections as _col
-                            file_counts = _col.Counter()
-                            for line in combined.split('\n'):
-                                m = _re.match(r'^([^(]+)\(', line)
-                                if m and 'error TS' in line:
-                                    fname = m.group(1).strip().split('/')[-1]
-                                    file_counts[fname] += 1
-                            file_summary = "\n".join(
-                                f"  {fname:<45} {cnt:>3} error(s)"
-                                for fname, cnt in file_counts.most_common()
-                            )
-                            # Delta vs previous build
-                            if self.last_build_error_count is not None:
-                                delta = error_count - self.last_build_error_count
-                                if delta < 0:
-                                    delta_str = f"  ({abs(delta)} fewer than last build)"
-                                elif delta > 0:
-                                    delta_str = f"  ({delta} more than last build)"
-                                else:
-                                    delta_str = "  (same as last build)"
-                            else:
-                                delta_str = ""
-                            first_err = next((l for l in combined.split('\n') if 'error TS' in l), "")[:120]
-                            result = (
-                                f"[BUILD FAILED] {error_count} TypeScript error(s){delta_str}\n"
-                                f"\nErrors by file (most errors first):\n{file_summary}\n"
-                                f"\nFull output:\n{combined[:3500]}"
-                            )
-                            await self.push_action_log("run_build", f"FAILED {error_count} errors{delta_str} | top: {file_summary.split(chr(10))[0].strip()}", "fail")
-                            self.last_build_error_count = error_count
-                        await self.push_agent_state("last_build_result", result)
-                        await self.push_remote_log(result[:500])
-                        logger.info(result[:500])
+        await self.log("Synthesizing creative brief...")
+        synthesis_prompt = (
+            "You are a game designer and creative director.\n"
+            "Write a creative brief for an AI game developer based on these intake answers.\n\n"
+            f"ANSWERS:\n{json.dumps(answers, indent=2)}\n\n"
+            "Write brief.md with sections: One-Line Pitch, Tone & Mood, Visual Language, "
+            "Core Mechanic, World & Setting, Reference Points, MVP Definition.\n"
+            "Be specific, evocative, and concrete. Output only the markdown."
+        )
 
-                    elif tool == "write_scratchpad":
-                        note = action.get("note", action.get("content", ""))
-                        self.scratchpad = note  # Overwrites — Gemma maintains it herself
-                        await self.push_agent_state("scratchpad", note)
-                        await self.push_remote_log(f"Scratchpad updated ({len(note)} chars)")
-                        await self.push_action_log("write_scratchpad", note[:80], "ok")
+        response = await self.prompt_gemma(synthesis_prompt, temperature=0.7)
+        brief = response.strip() if response.strip() else \
+                "\n".join(f"## {k.title()}\n{v}" for k, v in answers.items())
+        self.write_agent_file(BRIEF_PATH, brief)
 
-                    elif tool == "run_tests":
-                        logger.info("Running Vitest test suite...")
-                        await self.push_remote_log("Running vitest run...")
-                        code, out, err = await self.execute_native("CI=true npx vitest run 2>&1")
-                        combined = (out + err).strip()
-                        result = f"[TESTS {'PASSED' if code == 0 else 'FAILED'}]\n{combined[:4000]}"
-                        await self.push_agent_state("last_test_result", result)
-                        await self.push_remote_log(result[:300])
-                        logger.info(result[:300])
-                        await self.push_action_log("run_tests", result.split('\n')[0][:100], "ok" if code == 0 else "fail")
+        await self.log("Bootstrap complete. Entering CREATIVE.")
+        self.append_journal(
+            f"Bootstrap complete.\n- Game: {manifest['name']}\n"
+            f"- Type: {manifest['game_type']}\n- Art: {manifest['art_style']}")
+        self.git_commit("init: bootstrap complete")
 
-                    elif tool == "capture_screenshot":
-                        logger.info("Capturing screenshot via Playwright...")
-                        await self.push_remote_log("Capturing screenshot via Playwright...")
-                        import subprocess as _sp, signal as _sig, time as _time
-                        vite_proc = None
+    # ── Mode: CREATIVE ────────────────────────────────────────────────────────
+
+    async def run_creative_iteration(self, state: dict):
+        """One iteration of the CREATIVE autonomous loop."""
+        manifest = self.read_manifest()
+        brief    = self.read_brief()
+
+        phase_complete = os.path.join(WORKSPACE_DIR, "lore", "PHASE_COMPLETE.md")
+        if os.path.exists(phase_complete):
+            await self.log("PHASE_COMPLETE detected. Entering ARCHITECT.")
+            self.set_mode("ARCHITECT")
+            return
+
+        human_feedback = self.read_feedback()
+        if human_feedback:
+            await self.push_human_message(human_feedback)
+        pending = await self.fetch_pending_chat()
+        if pending:
+            human_feedback = (human_feedback + "\n" + "\n".join(pending)).strip()
+        chat_history = await self.fetch_chat_history()
+        reminders    = await self.fetch_reminders()
+
+        lore_tree = subprocess.run(
+            ["find", "lore", "-type", "f"],
+            cwd=WORKSPACE_DIR, capture_output=True, text=True
+        ).stdout.strip() or "(empty — start creating)"
+
+        manifesto_path = os.path.join(ROOT_DIR, "manifesto.md")
+        manifesto = open(manifesto_path).read() if os.path.exists(manifesto_path) else ""
+        last_cmd  = self.read_last_output()[:2000]
+        last_thought = state.get("last_thought", "")
+
+        prompt = (
+            manifesto + "\n\n"
+            "[PHASE: CREATIVE — WORLD BUILDING, LORE & VISUAL DESIGN]\n"
+            f"You are the author, world-builder, and art director for: **{manifest.get('name', 'the game')}**\n\n"
+            f"GAME BRIEF:\n{brief[:1200]}\n\n"
+            f"[LORE FILE TREE]\n{lore_tree}\n\n"
+            f"[LAST COMMAND OUTPUT]\n{last_cmd}\n\n"
+            f"[CHAT HISTORY]\n{chat_history}\n\n"
+            + (f"[REMINDERS]\n{reminders}\n\n" if reminders else "")
+            + (f"[MESSAGE FROM HUMAN]\n{human_feedback}\n\n" if human_feedback else "")
+            + f"[LAST THOUGHT]\n{last_thought}\n\n"
+            f"Iteration {self.iteration}. Think freely, then output ONE JSON action.\n\n"
+            "Available tools: create_file, read_file, run_bash, chat_respond, update_state, "
+            "add_reminder, generate_image, search_web, analyze_image.\n"
+            'Declare creative phase complete: {"thought": "ready", "tool": "create_file", '
+            '"filename": "lore/PHASE_COMPLETE.md", "content": "Creative phase complete."}\n'
+            'Example: {"thought": "write the creation myth", "tool": "create_file", '
+            '"filename": "lore/world/creation_myth.md", "content": "..."}\n'
+        )
+        if self.iteration % 20 == 0 and self.iteration > 0:
+            prompt += "\n[SELF-CRITIQUE]: Re-read your most recent lore file and deepen what feels thin.\n"
+        if self.iteration % 100 == 0 and self.iteration > 0:
+            prompt += f"\n[PORTFOLIO UPDATE — ITER {self.iteration}]: Update lore/presentations/presentation_current.md.\n"
+
+        await self.log("Querying Gemma (CREATIVE)...")
+        response = await self.prompt_gemma(prompt)
+        await self.log(f"Gemma output:\n{response}")
+
+        action = self._parse_json_action(response)
+        if action:
+            if action.get("thought"):
+                await self.push_state("last_thought", action["thought"])
+            await self._dispatch_creative_tool(action)
+        else:
+            await self.log("No valid JSON action found.")
+
+    # ── Mode: ARCHITECT ───────────────────────────────────────────────────────
+
+    async def run_architect(self):
+        """One-shot: Gemma produces task_queue.md -> enters BUILD."""
+        if os.path.exists(TASK_QUEUE_PATH):
+            await self.log("task_queue.md exists. Entering BUILD.")
+            self.set_mode("BUILD")
+            return
+
+        brief    = self.read_brief()
+        manifest = self.read_manifest()
+
+        src_tree = subprocess.run(
+            ["find", "src", "-type", "f", "-name", "*.ts"],
+            cwd=WORKSPACE_DIR, capture_output=True, text=True
+        ).stdout.strip() or "(none — greenfield project)"
+
+        specs_content = ""
+        specs_dir = os.path.join(WORKSPACE_DIR, "specs")
+        if os.path.exists(specs_dir):
+            for root, _, files in os.walk(specs_dir):
+                for f in files:
+                    if f.endswith('.md') and len(specs_content) < 3000:
                         try:
-                            # First check build is clean — a broken build = blank page
-                            build_code, build_out, build_err = await self.execute_native("npx tsc --noEmit 2>&1")
-                            build_errors = (build_out + build_err).count("error TS")
-                            if build_errors > 0:
-                                msg = f"[SCREENSHOT BLOCKED] Build has {build_errors} TypeScript error(s). Run run_build to see them, fix all errors, then screenshot."
-                                await self.push_agent_state("last_build_result", msg)
-                                await self.push_remote_log(msg)
-                                logger.warning(msg)
-                            else:
-                                vite_proc = _sp.Popen(
-                                    ["npx", "vite", "--port", "5173"],
-                                    cwd=WORKSPACE_DIR,
-                                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-                                    preexec_fn=os.setsid
-                                )
-                                # Wait up to 15s for Vite port to open
-                                import socket as _sock
-                                for _ in range(30):
-                                    _time.sleep(0.5)
-                                    try:
-                                        s = _sock.create_connection(("localhost", 5173), timeout=1)
-                                        s.close()
-                                        break
-                                    except OSError:
-                                        pass
-                                # Extra 4s for PixiJS canvas to initialize after port is up
-                                _time.sleep(4)
-                                code, out, err = await self.execute_native("node capture_screenshot.js")
-                                if code == 0:
-                                    screenshot_path = os.path.join(WORKSPACE_DIR, "latest_screenshot.png")
-                                    # Check file is non-trivial (>10KB = real render, not blank page)
-                                    size = os.path.getsize(screenshot_path) if os.path.exists(screenshot_path) else 0
-                                    if size < 10240:
-                                        await self.push_remote_log(f"[SCREENSHOT WARNING] File is only {size} bytes — the page may not have rendered. Check browser console errors via run_build first.")
-                                    await self.push_screenshot(screenshot_path)
-                                    await self.push_remote_log(f"Screenshot captured ({size} bytes) and uploaded to Dashboard.")
-                                    self.pending_screenshot = screenshot_path
-                                    await self.push_action_log("capture_screenshot", f"{size}b captured", "ok" if size > 10240 else "warn")
-                                else:
-                                    await self.push_remote_log(f"Screenshot failed: {err}")
-                                    await self.push_action_log("capture_screenshot", f"FAILED: {err[:80]}", "fail")
-                        except Exception as e:
-                            await self.push_remote_log(f"Screenshot error: {e}")
-                        finally:
-                            if vite_proc is not None:
-                                try:
-                                    os.killpg(os.getpgid(vite_proc.pid), _sig.SIGTERM)
-                                except Exception:
-                                    pass
-                            
-                    elif tool == "analyze_image":
-                        filename = action.get("filename", "")
-                        question = action.get("question", "Describe this image in rich detail — colors, mood, composition, atmosphere, what story it tells, what world it suggests.")
-                        filepath = os.path.join(WORKSPACE_DIR, filename)
-                        logger.info(f"Analyzing image: {filepath}")
-                        await self.push_remote_log(f"Analyzing image: {filename}")
-                        if not os.path.exists(filepath):
-                            await self.push_agent_state("last_search_result", f"[IMAGE NOT FOUND]: {filename} — use run_bash with curl to download it first.")
-                        else:
-                            analysis_prompt = f"You are a creative director analyzing a reference image to inspire the world you are building. {question}\n\nDescribe what you see in rich, evocative detail. Note the colors, mood, scale, what the figures are doing, what the landscape suggests about history and time. Let the image ask you questions about the world."
-                            analysis = await self.prompt_gemma(analysis_prompt, image_path=filepath)
-                            result = f"[IMAGE ANALYSIS: {filename}]\n{analysis}"
-                            await self.push_agent_state("last_search_result", result)
-                            await self.push_remote_log(f"Image analysis complete: {filename}")
+                            specs_content += f"\n### {f}\n{open(os.path.join(root, f)).read()[:600]}\n"
+                        except Exception:
+                            pass
 
-                    elif tool == "generate_image":
-                        prompt    = action.get("prompt", "")
-                        negative  = action.get("negative", "ugly, blurry, low quality, watermark, text, deformed")
-                        filename  = action.get("filename", f"concept_{self.iteration}.png")
-                        width     = int(action.get("width", 1024))
-                        height    = int(action.get("height", 576))
-                        steps     = int(action.get("steps", 25))
-                        cfg       = float(action.get("cfg", 7.0))
-                        # Filename loop guard — detect >3 consecutive generates of the same file
-                        if filename == self.last_gen_filename:
-                            self.last_gen_repeat_count += 1
-                        else:
-                            self.last_gen_filename = filename
-                            self.last_gen_repeat_count = 1
-                        if self.last_gen_repeat_count >= 3:
-                            await self.push_agent_state("last_search_result",
-                                f"[GENERATE_LOOP]: You have generated '{filename}' {self.last_gen_repeat_count} times in a row. "
-                                f"Stop regenerating this file. Either: (1) accept the result and move on, "
-                                f"(2) use analyze_image to critique what you already have, or "
-                                f"(3) create a NEW file with a different descriptive name. Change approach now.")
-                            await self.push_remote_log(f"[LOOP GUARD] Blocked repeat generation #{self.last_gen_repeat_count}: {filename}")
-                            continue
-                        # Resolve model: accept Gemma's hint if it's a known SDXL/SD checkpoint; skip FLUX models
-                        _sdxl_models = {"illustriousXL_v01.safetensors", "sd_xl_base_1.0.safetensors"}
-                        _requested_model = action.get("model", "")
-                        _ckpt_dir = "/Users/max/ComfyUI/models/checkpoints/"
-                        _preferred_default = "illustriousXL_v01.safetensors" if os.path.exists(_ckpt_dir + "illustriousXL_v01.safetensors") else "sd_xl_base_1.0.safetensors"
-                        _candidate = _requested_model if _requested_model in _sdxl_models else _preferred_default
-                        model = _candidate if os.path.exists(_ckpt_dir + _candidate) else "sd_xl_base_1.0.safetensors"
-                        out_dir   = os.path.join(WORKSPACE_DIR, "lore", "visuals", "generated")
-                        os.makedirs(out_dir, exist_ok=True)
-                        out_path  = os.path.join(out_dir, filename)
-                        logger.info(f"Generating image: {filename} (model={model})")
-                        await self.push_remote_log(f"Generating image via ComfyUI ({model}): {filename}")
-                        try:
-                            import uuid as _uuid, time as _time
-                            comfy_url = "http://127.0.0.1:8188"
-                            client_id = str(_uuid.uuid4())
-                            # SDXL/SD workflow: CheckpointLoaderSimple with positive + negative prompts
-                            workflow = {
-                                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model}},
-                                "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": prompt}},
-                                "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": negative}},
-                                "4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-                                "5": {"class_type": "KSampler", "inputs": {
-                                    "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
-                                    "latent_image": ["4", 0], "seed": self.iteration,
-                                    "steps": steps, "cfg": cfg, "sampler_name": "euler",
-                                    "scheduler": "karras", "denoise": 1.0
-                                }},
-                                "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
-                                "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": os.path.splitext(filename)[0]}},
-                            }
-                            async with aiohttp.ClientSession() as sess:
-                                resp = await sess.post(f"{comfy_url}/prompt", json={"prompt": workflow, "client_id": client_id})
-                                data = await resp.json()
-                                prompt_id = data.get("prompt_id")
-                            # Poll until done (max 5 minutes)
-                            generated_path = None
-                            for _ in range(300):
-                                await asyncio.sleep(1)
-                                async with aiohttp.ClientSession() as sess:
-                                    hr = await sess.get(f"{comfy_url}/history/{prompt_id}")
-                                    hist = await hr.json()
-                                if prompt_id in hist:
-                                    outputs = hist[prompt_id].get("outputs", {})
-                                    for node_out in outputs.values():
-                                        for img in node_out.get("images", []):
-                                            subfolder = img.get("subfolder", "")
-                                            img_name  = img.get("filename", "")
-                                            async with aiohttp.ClientSession() as sess:
-                                                params = {"filename": img_name, "subfolder": subfolder, "type": "output"}
-                                                ir = await sess.get(f"{comfy_url}/view", params=params)
-                                                img_bytes = await ir.read()
-                                            with open(out_path, "wb") as f:
-                                                f.write(img_bytes)
-                                            generated_path = out_path
-                                    break
-                            if generated_path:
-                                rel_path = os.path.relpath(generated_path, WORKSPACE_DIR)
-                                await self.push_agent_state("last_search_result", f"[IMAGE GENERATED]: lore/visuals/generated/{filename} — use analyze_image with filename='lore/visuals/generated/{filename}' to review it.")
-                                await self.push_remote_log(f"Image generated: {rel_path}")
-                                # Auto-push to dashboard
-                                await self.push_screenshot(generated_path)
-                            else:
-                                await self.push_agent_state("last_search_result", "[GENERATE FAILED]: ComfyUI timed out or returned no image.")
-                                await self.push_remote_log("Image generation failed: timeout")
-                        except Exception as e:
-                            await self.push_agent_state("last_search_result", f"[GENERATE ERROR]: {e}")
-                            await self.push_remote_log(f"Image generation error: {e}")
+        await self.log("ARCHITECT: Gemma designing task_queue.md...")
+        prompt = (
+            "You are a senior game developer and architect.\n"
+            "Design a complete ordered task queue for building this game.\n\n"
+            f"GAME BRIEF:\n{brief[:1500]}\n\n"
+            f"TECH STACK: {manifest.get('tech_stack', 'typescript_pixijs')}\n"
+            f"GAME TYPE:  {manifest.get('game_type')}\n"
+            f"ART STYLE:  {manifest.get('art_style')}\n"
+            f"SCOPE:      {manifest.get('scope', 'indie')}\n\n"
+            f"EXISTING SOURCE FILES:\n{src_tree}\n\n"
+            f"SPECS:\n{specs_content[:2000]}\n\n"
+            "Format each task:\n"
+            "- [ ] **TASK-NNN**: Short title\n"
+            "  - **Goal**: What this implements\n"
+            "  - **Files**: Full paths from src/ to create or modify\n"
+            "  - **Depends on**: TASK-NNN or none\n"
+            "  - **Acceptance**: build passes / test passes / visual check\n\n"
+            "Start with foundational systems, then gameplay, then UI, then polish.\n"
+            f"Aim for 15-25 tasks for a {manifest.get('scope','indie')}-scope "
+            f"{manifest.get('game_type','')} game.\n"
+            "Output only the task_queue.md markdown."
+        )
 
-                    elif tool == "search_codebase":
-                        query = action.get("query", "")
-                        logger.info(f"RAG Search: {query}")
-                        await self.push_remote_log(f"Searching codebase for: {query}")
-                        try:
-                            results = self.collection.query(query_texts=[query], n_results=3)
-                            docs = results.get("documents", [[]])[0]
-                            metas = results.get("metadatas", [[]])[0]
-                            
-                            if not docs:
-                                res_str = "No results found."
-                            else:
-                                res_str = ""
-                                for doc, meta in zip(docs, metas):
-                                    res_str += f"File: {meta.get('path')}\n{doc}\n---\n"
-                                    
-                            await self.push_agent_state("last_search_result", res_str)
-                            await self.push_remote_log("Search complete. Results added to next prompt.")
-                            await self.push_action_log("search_codebase", f"'{query[:60]}' → {len(docs)} results", "ok")
-                        except Exception as e:
-                            await self.push_remote_log(f"Search failed: {str(e)}")
-                            
-                    elif tool == "search_web":
-                        query = action.get("query", "")
-                        logger.info(f"Web Search: {query}")
-                        await self.push_remote_log(f"Searching the web for: {query}")
-                        try:
-                            results = self.search_web(query)
-                            await self.push_agent_state("last_search_result", results)
-                            await self.push_remote_log("Web search complete. Results added to next prompt.")
-                            await self.push_action_log("search_web", f"'{query[:80]}'", "ok")
-                        except Exception as e:
-                            await self.push_remote_log(f"Web search failed: {str(e)}")
-                            
-                    elif tool == "run_bash":
-                        cmd = action.get("command", "")
-                        msg = f"Executing Natively: {cmd}"
-                        logger.info(msg)
-                        await self.push_remote_log(msg)
-                        
-                        code, out, err = await self.execute_native(cmd)
-                        
-                        # Truncate output to prevent blowing up the context window (Ollama limit/speed)
-                        if len(out) > 10000:
-                            out = "...[TRUNCATED]...\n" + out[-10000:]
-                        if len(err) > 2000:
-                            err = "...[TRUNCATED]...\n" + err[-2000:]
-                            
-                        res_msg = f"Native Result: {out}\n{err}"
-                        if not out.strip() and not err.strip():
-                            res_msg = "Native Result: (Success - No output text produced)"
-                            
-                        logger.info(res_msg[:10000] + ("..." if len(res_msg) > 10000 else ""))
-                        await self.push_remote_log(res_msg[:10000] + ("..." if len(res_msg) > 10000 else ""))
-                        
-                        # FIX: Actually save the output so the agent can see it next loop
-                        await self.push_agent_state("last_command_output", res_msg)
-                        self.failures = 0
-                        await self.push_agent_state("consecutive_failures", "0")
-                        
-                        short_cmd = cmd[:30] + ("..." if len(cmd) > 30 else "")
-                        self.cognitive_history.append(f"Iteration {self.iteration}: Ran '{short_cmd}'")
-                        if len(self.cognitive_history) > 10:
-                            self.cognitive_history.pop(0)
-                        first_out = (out.strip().split('\n')[0] if out.strip() else err.strip()[:80])[:80]
-                        await self.push_action_log("run_bash", f"`{cmd[:50]}` → {first_out}", "ok" if code == 0 else "fail")
+        response = await self.prompt_gemma(prompt, temperature=0.4)
+        if response.strip():
+            self.write_agent_file(TASK_QUEUE_PATH, response.strip())
+            await self.log("task_queue.md written. Entering BUILD.")
+            self.append_journal("ARCHITECT complete. Task queue generated.")
+            self.set_mode("BUILD")
+            self.git_commit("chore: architect phase complete — task_queue.md created")
+        else:
+            arch_retry_path = os.path.join(AGENT_DIR, "architect_retries.json")
+            ar = json.loads(open(arch_retry_path).read()) if os.path.exists(arch_retry_path) else {"count": 0}
+            ar["count"] = ar.get("count", 0) + 1
+            self.write_agent_file(arch_retry_path, json.dumps(ar))
+            await self.log(f"ARCHITECT: empty response (attempt {ar['count']}/3). Retrying.")
+            if ar["count"] >= 3:
+                # Auto-generate a minimal task queue so BUILD can start
+                minimal_queue = (
+                    "# Task Queue\n\n"
+                    "- [ ] **TASK-001**: Initialize PixiJS application\n"
+                    "  - **Goal**: Set up PixiJS app, stage, and main game loop\n"
+                    "  - **Files**: `src/client/main.ts`\n"
+                    "  - **Depends on**: none\n"
+                    "  - **Acceptance**: build passes\n\n"
+                    "- [ ] **TASK-002**: Implement core engine\n"
+                    "  - **Goal**: CoreEngine class managing all game systems\n"
+                    "  - **Files**: `src/client/core/CoreEngine.ts`\n"
+                    "  - **Depends on**: TASK-001\n"
+                    "  - **Acceptance**: build passes\n"
+                )
+                self.write_agent_file(TASK_QUEUE_PATH, minimal_queue)
+                if os.path.exists(arch_retry_path):
+                    os.remove(arch_retry_path)
+                await self.log("ARCHITECT: Auto-generated minimal task_queue.md after 3 failures. Entering BUILD.")
+                self.append_journal("ARCHITECT: Auto-generated minimal task_queue after 3 empty responses.")
+                self.set_mode("BUILD")
 
-                    elif tool == "create_file":
-                        self.consecutive_build_count = 0  # Writing code resets the build-spin counter
-                        filename = action.get("filename", "")
-                        content = action.get("content", "")
-                        msg = f"Creating file: {filename}"
-                        logger.info(msg)
-                        await self.push_remote_log(msg)
-                        
-                        try:
-                            # Create directories if they don't exist
-                            full_path = os.path.join(WORKSPACE_DIR, filename)
-                            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                            with open(full_path, 'w') as f:
-                                f.write(content)
-                            
-                            res_msg = f"Successfully created {filename}"
-                            await self.push_agent_state("last_command_output", res_msg)
-                            await self.push_remote_log(res_msg)
-                            self.failures = 0
-                            await self.push_agent_state("consecutive_failures", "0")
-                            
-                            # Add to cognitive history
-                            self.cognitive_history.append(f"Iteration {self.iteration}: Created '{filename}'. Result: Success.")
-                            if len(self.cognitive_history) > 10:
-                                self.cognitive_history.pop(0)
-                            await self.push_action_log("create_file", filename, "ok")
-                        except Exception as e:
-                            res_msg = f"Failed to create file: {str(e)}"
-                            await self.push_agent_state("last_command_output", res_msg)
-                            await self.push_remote_log(res_msg)
-                            self.failures += 1
-                            await self.push_agent_state("consecutive_failures", str(self.failures))
-                            await self.push_action_log("create_file", f"FAILED {filename}: {str(e)[:80]}", "fail")
-                            
-                    elif tool == "read_file":
-                        filename = action.get("filename", "")
-                        msg = f"Reading file: {filename}"
-                        logger.info(msg)
-                        await self.push_remote_log(msg)
-                        
-                        try:
-                            full_path = os.path.join(WORKSPACE_DIR, filename)
-                            with open(full_path, 'r') as f:
-                                content = f.read()
-                            
-                            # Truncate if insanely large, though we have a 300-line mandate
-                            if len(content) > 15000:
-                                content = content[:15000] + "\n...[TRUNCATED]..."
-                                
-                            res_msg = f"File Contents of {filename}:\n{content}"
-                            await self.push_agent_state("last_command_output", res_msg)
-                            await self.push_remote_log(f"Successfully read {filename}")
-                            self.failures = 0
-                            await self.push_agent_state("consecutive_failures", "0")
-                            
-                            self.cognitive_history.append(f"Iteration {self.iteration}: Read '{filename}'.")
-                            if len(self.cognitive_history) > 10:
-                                self.cognitive_history.pop(0)
-                            await self.push_action_log("read_file", filename, "ok")
-                        except Exception as e:
-                            res_msg = f"Failed to read file: {str(e)}"
-                            await self.push_agent_state("last_cmd", res_msg)
-                            await self.push_remote_log(res_msg)
-                            self.failures += 1
-                            await self.push_agent_state("consecutive_failures", str(self.failures))
-                            await self.push_action_log("read_file", f"FAILED {filename}: {str(e)[:80]}", "fail")
-                            
-                    else:
-                        err_msg = f"JSON Parser Error: Invalid or missing 'tool' key. You must use 'tool': 'run_bash' and 'command': '<your command>'. You provided: {response[json_start:json_end]}"
-                        logger.warning(err_msg)
-                        await self.push_remote_log(err_msg)
-                        await self.push_agent_state("last_command_output", err_msg)
+    # ── Mode: REPAIR ──────────────────────────────────────────────────────────
+
+    async def run_repair_iteration(self, state: dict):
+        """One SAR iteration: deterministic triage + targeted LLM rewrite per file."""
+        brief = self.read_brief()
+
+        await self.log("REPAIR: Running tsc --noEmit...")
+        _, out, err = await self.execute_native("npx tsc --noEmit 2>&1", timeout=120)
+        combined = (out + err).strip()
+
+        if not combined or "error TS" not in combined:
+            prior = state.get("pre_repair_mode", "BUILD")
+            await self.log(f"REPAIR: Build clean! Returning to {prior}.")
+            self.set_mode(prior)
+            await self.push_state("mode", prior)
+            self.clear_repair_retries()
+            self.append_journal("REPAIR complete. Build is clean.")
+            self.git_commit("fix: all TypeScript errors resolved")
+            return
+
+        error_map = parse_ts_errors(combined)
+        total     = sum(len(v) for v in error_map.values())
+        await self.log(f"REPAIR: {total} errors across {len(error_map)} files.")
+        await self.push_state("last_build_result", f"{total} errors in {len(error_map)} files")
+
+        ordered      = build_repair_order(error_map)
+        retry_counts = self.read_repair_retries()
+
+        # Stuck files stored locally (dashboard state is not reliable for persistence)
+        stuck_path   = os.path.join(AGENT_DIR, "stuck_files.json")
+        stuck_files  = set(json.loads(open(stuck_path).read()) if os.path.exists(stuck_path) else [])
+
+        target_file  = next(
+            (f for f in ordered if f not in stuck_files),
+            None
+        )
+
+        if target_file is None:
+            # All remaining errored files are stuck — move forward rather than spinning
+            stuck_list = ", ".join(ordered)
+            prior = state.get("pre_repair_mode", "BUILD")
+            await self.log(f"REPAIR: All stuck ({stuck_list}). Giving up and returning to {prior}.")
+            await self.push_chat(
+                f"Exhausted all retries. Giving up on: {stuck_list}. "
+                f"Moving on to {prior} with {total} errors remaining. Human review advised.")
+            self.append_journal(f"REPAIR: Gave up on {stuck_list}. Entered {prior} with {total} errors.")
+            self.set_mode(prior)
+            # Do NOT clear stuck_files — BUILD needs it to skip these files
+            self.clear_repair_retries()
+            return
+
+        errors = error_map[target_file]
+        retry  = retry_counts.get(target_file, 0)
+        await self.log(f"REPAIR: Targeting {target_file} ({len(errors)} errors, attempt {retry+1}/{MAX_RETRIES})")
+
+        # Step 1: trivial auto-fixes
+        changed, new_content = attempt_trivial_fixes(target_file, errors)
+        if changed:
+            open(os.path.join(WORKSPACE_DIR, target_file), 'w').write(new_content)
+            await self.log(f"REPAIR: Applied trivial fixes to {target_file}")
+            _, out2, err2 = await self.execute_native("npx tsc --noEmit 2>&1", timeout=120)
+            remaining = parse_ts_errors((out2 + err2).strip()).get(target_file, [])
+            if not remaining:
+                await self.log(f"REPAIR: {target_file} fully resolved by trivial fixes.")
+                self.append_journal(f"REPAIR: Auto-fixed {target_file} ({len(errors)} trivial errors).")
+                retry_counts.pop(target_file, None)
+                self.write_repair_retries(retry_counts)
+                return
+            errors = remaining
+
+        # Step 2: assemble context (target + direct imports, capped at 5 context files)
+        # On retry >= 2 with no progress, drop context files — Gemma gets overwhelmed
+        import_paths  = resolve_imports(target_file)
+        max_ctx_files = 0 if retry >= 2 else 3
+        ctx_char_limit = 2000 if retry >= 1 else 4000
+        context_files = {}
+        for path in [target_file] + import_paths[:max_ctx_files]:
+            full = os.path.join(WORKSPACE_DIR, path)
+            if os.path.exists(full):
+                content = open(full).read()
+                context_files[path] = content[:ctx_char_limit] + "\n...[TRUNCATED]..." if len(content) > ctx_char_limit else content
+
+        # Step 3: build task card and call Gemma
+        # Check if this file is flagged for spec-rewrite (nuke) mode
+        nuke_path  = os.path.join(AGENT_DIR, "nuke_files.json")
+        nuke_files = set(json.loads(open(nuke_path).read()) if os.path.exists(nuke_path) else [])
+        if target_file in nuke_files:
+            await self.log(f"REPAIR: {target_file} is in NUKE mode — rewriting from spec.")
+            task_card = assemble_nuke_prompt(target_file, errors, brief)
+        else:
+            pixi_hints      = lookup_pixi_type_hints(errors)
+            conflict_hints  = lookup_conflicting_type_hints(target_file, errors)
+            prev_err_path   = os.path.join(AGENT_DIR, f"prev_errors_{target_file.replace('/', '_')}.json")
+            previous_new_errors = json.loads(open(prev_err_path).read()) if os.path.exists(prev_err_path) else None
+            task_card = assemble_task_card(target_file, errors, context_files, brief, retry, previous_new_errors, full_tsc_output=combined) + pixi_hints + conflict_hints
+            if pixi_hints:
+                await self.log(f"REPAIR: Injected PixiJS type hints for {target_file}.")
+            if conflict_hints:
+                await self.log(f"REPAIR: Injected type-conflict hints for {target_file}.")
+        await self.log(f"REPAIR: Calling Gemma for {target_file} ({len(context_files)} ctx files, retry={retry}, nuke={'yes' if target_file in nuke_files else 'no'})...")
+        response = await self.prompt_gemma(task_card, temperature=0.2, max_tokens=8192)
+
+        # Step 4: extract code block
+        new_code = extract_code_block(response)
+        await self.log(f"REPAIR: Response length={len(response)} chars, code extracted={len(new_code)} chars.")
+        if not new_code:
+            await self.log(f"REPAIR: No code block returned for {target_file}. Incrementing retry.")
+            retry_counts[target_file] = retry + 1
+            self.write_repair_retries(retry_counts)
+            # On repeated no-code responses, try without context files next time
+            if retry + 1 >= 2:
+                await self.log(f"REPAIR: 2+ no-code responses for {target_file} — next attempt will strip context.")
+            # Auto-stuck if we've hit MAX_RETRIES with no code at all
+            if retry_counts[target_file] >= MAX_RETRIES:
+                stuck_files.add(target_file)
+                self.write_agent_file(stuck_path, json.dumps(list(stuck_files)))
+                retry_counts.pop(target_file, None)
+                self.write_repair_retries(retry_counts)
+                await self.log(f"REPAIR: {target_file} auto-marked stuck after {MAX_RETRIES} no-code responses.")
+                self.append_journal(f"REPAIR: Auto-stuck {target_file} — never produced a code block.")
+            return
+
+        # Step 5: sanity check — don't lose exports
+        full_path    = os.path.join(WORKSPACE_DIR, target_file)
+        original     = open(full_path).read() if os.path.exists(full_path) else ""
+        orig_exports = set(re.findall(r'export (?:class|interface|type|enum|function|const) (\w+)', original))
+        new_exports  = set(re.findall(r'export (?:class|interface|type|enum|function|const) (\w+)', new_code))
+        missing      = orig_exports - new_exports
+        if missing:
+            await self.log(f"REPAIR: Sanity fail — missing exports {missing}. Incrementing retry.")
+            retry_counts[target_file] = retry + 1
+            self.write_repair_retries(retry_counts)
+            return
+
+        # Step 5b: brace-balance check — reject truncated output
+        open_braces  = new_code.count('{') - new_code.count('\\{')
+        close_braces = new_code.count('}') - new_code.count('\\}')
+        if open_braces != close_braces:
+            await self.log(f"REPAIR: Brace mismatch ({open_braces} open vs {close_braces} close) — likely truncated. Incrementing retry.")
+            retry_counts[target_file] = retry + 1
+            self.write_repair_retries(retry_counts)
+            return
+
+        # Step 6: write new content
+        open(full_path, 'w').write(new_code)
+        await self.log(f"REPAIR: Wrote new {target_file}")
+
+        # Step 7: verify — compare error count
+        _, out3, err3 = await self.execute_native("npx tsc --noEmit 2>&1", timeout=120)
+        new_map   = parse_ts_errors((out3 + err3).strip())
+        new_total = sum(len(v) for v in new_map.values())
+
+        if new_total < total:
+            delta = total - new_total
+            await self.log(f"REPAIR: {target_file} fixed. Errors: {total} -> {new_total} ({delta} resolved)")
+            retry_counts.pop(target_file, None)
+            # Un-stick any file that no longer has errors (unblocked by this fix)
+            stuck_files = {f for f in stuck_files if f in new_map}
+            self.write_agent_file(stuck_path, json.dumps(list(stuck_files)))
+            # Clear nuke flag on success
+            nuke_path  = os.path.join(AGENT_DIR, "nuke_files.json")
+            nuke_files = set(json.loads(open(nuke_path).read()) if os.path.exists(nuke_path) else [])
+            nuke_files.discard(target_file)
+            self.write_agent_file(nuke_path, json.dumps(list(nuke_files)))
+            self.write_repair_retries(retry_counts)
+            await self.push_state("last_build_result", f"{new_total} errors remaining")
+            self.append_journal(
+                f"REPAIR: Fixed {target_file}.\n"
+                f"- Errors: {total}->{new_total} ({delta} resolved)\n"
+                f"- Files remaining with errors: {len(new_map)}")
+            self.git_commit(f"fix: {target_file} — {delta} TS errors resolved ({new_total} remain)")
+            await self.push_action("repair_fix", target_file, "ok")
+        elif new_map.get(target_file) and len(new_map.get(target_file, [])) < len(errors):
+            # Target file improved but other files got worse — accept the fix, let REPAIR handle spillover
+            delta = total - new_total
+            await self.log(f"REPAIR: {target_file} improved (target errors reduced) despite net {total}->{new_total}. Accepting.")
+            retry_counts.pop(target_file, None)
+            stuck_files = {f for f in stuck_files if f in new_map}
+            self.write_agent_file(stuck_path, json.dumps(list(stuck_files)))
+            nuke_path  = os.path.join(AGENT_DIR, "nuke_files.json")
+            nuke_files = set(json.loads(open(nuke_path).read()) if os.path.exists(nuke_path) else [])
+            nuke_files.discard(target_file)
+            self.write_agent_file(nuke_path, json.dumps(list(nuke_files)))
+            self.write_repair_retries(retry_counts)
+            await self.push_state("last_build_result", f"{new_total} errors remaining")
+            self.append_journal(f"REPAIR: Partial fix {target_file}. {total}->{new_total}.")
+            self.git_commit(f"fix: {target_file} — partial improvement ({new_total} remain)")
+            await self.push_action("repair_fix", target_file, "ok")
+        else:
+            await self.log(f"REPAIR: {target_file} unchanged ({total}->{new_total}). Rolling back.")
+            # Persist the new errors Gemma introduced so next attempt can learn from them
+            new_errors_in_other_files = {f: v for f, v in new_map.items() if f not in error_map or len(v) > len(error_map.get(f, []))}
+            prev_err_path = os.path.join(AGENT_DIR, f"prev_errors_{target_file.replace('/', '_')}.json")
+            self.write_agent_file(prev_err_path, json.dumps(new_errors_in_other_files))
+            self.git_rollback_file(target_file)
+            retry_counts[target_file] = retry + 1
+            self.write_repair_retries(retry_counts)
+            self.append_journal(
+                f"REPAIR: Failed {target_file} attempt {retry+1}. {total}->{new_total}. Rolled back.")
+            await self.push_action("repair_fix", target_file, "fail")
+            # After MAX_RETRIES failures, auto-mark as stuck — never rely on human to unblock
+            if retry_counts[target_file] >= MAX_RETRIES:
+                stuck_files.add(target_file)
+                self.write_agent_file(stuck_path, json.dumps(list(stuck_files)))
+                retry_counts.pop(target_file, None)
+                self.write_repair_retries(retry_counts)
+                await self.log(f"REPAIR: {target_file} auto-marked stuck after {MAX_RETRIES} attempts — skipping.")
+                self.append_journal(f"REPAIR: Auto-stuck {target_file} after {MAX_RETRIES} failed attempts.")
+                await self.push_chat(
+                    f"⚠️ REPAIR: Auto-skipped `{target_file}` after {MAX_RETRIES} failed attempts. "
+                    f"Added to stuck_files.json — continuing."
+                )
+
+    # ── Mode: BUILD ───────────────────────────────────────────────────────────
+
+    async def run_build_iteration(self, state: dict):
+        """PLAN turn -> EXECUTE turn. Build-check triggers REPAIR if broken."""
+        # Health check — skip REPAIR if every errored file is already stuck
+        _, out, err = await self.execute_native("npx tsc --noEmit 2>&1", timeout=120)
+        combined = (out + err).strip()
+        if combined and "error TS" in combined:
+            error_map  = parse_ts_errors(combined)
+            total      = sum(len(v) for v in error_map.values())
+            stuck_path = os.path.join(AGENT_DIR, "stuck_files.json")
+            stuck_files = set(json.loads(open(stuck_path).read()) if os.path.exists(stuck_path) else [])
+            unstuck_errors = {f for f in error_map if f not in stuck_files}
+            if unstuck_errors:
+                await self.log(f"BUILD: Build broken ({total} errors). Entering REPAIR.")
+                await self.push_state("pre_repair_mode", "BUILD")
+                self.set_mode("REPAIR")
+                return
+            else:
+                # All remaining errors are in stuck files — unstick them and try again.
+                # Round 1: normal incremental repair.
+                # Round 2+: escalate to 'nuke and rebuild from spec' mode.
+                unstick_path = os.path.join(AGENT_DIR, "unstick_rounds.json")
+                unstick_data = json.loads(open(unstick_path).read()) if os.path.exists(unstick_path) else {}
+                round_key = ",".join(sorted(stuck_files & set(error_map.keys())))
+                round_count = unstick_data.get(round_key, 0)
+
+                files_to_retry = stuck_files & set(error_map.keys())
+                await self.log(f"BUILD: {total} errors in stuck files — unsticking {len(files_to_retry)} files (round {round_count + 1}).")
+
+                # On round 2+, escalate: mark files for full rewrite from spec
+                if round_count >= 1:
+                    nuke_path = os.path.join(AGENT_DIR, "nuke_files.json")
+                    nuke_files = set(json.loads(open(nuke_path).read()) if os.path.exists(nuke_path) else [])
+                    nuke_files.update(files_to_retry)
+                    self.write_agent_file(nuke_path, json.dumps(list(nuke_files)))
+                    await self.log(f"BUILD: Round {round_count + 1} — escalating to spec-rewrite mode for: {', '.join(files_to_retry)}")
+
+                for f in files_to_retry:
+                    stuck_files.discard(f)
+                self.write_agent_file(stuck_path, json.dumps(list(stuck_files)))
+                retry_counts = self.read_repair_retries()
+                for f in files_to_retry:
+                    retry_counts.pop(f, None)
+                self.write_repair_retries(retry_counts)
+                unstick_data[round_key] = round_count + 1
+                self.write_agent_file(unstick_path, json.dumps(unstick_data))
+                await self.push_state("pre_repair_mode", "BUILD")
+                self.set_mode("REPAIR")
+                return
+
+        # Ensure task queue exists
+        task_queue = self.read_agent_file(TASK_QUEUE_PATH)
+        if not task_queue:
+            await self.log("BUILD: No task_queue.md. Entering ARCHITECT.")
+            self.set_mode("ARCHITECT")
+            return
+
+        # Find next open task
+        unchecked = re.findall(r'- \[ \] \*\*([^*]+)\*\*: (.+)', task_queue)
+        if not unchecked:
+            await self.log("BUILD: All tasks complete! Entering PLAYTEST.")
+            self.set_mode("PLAYTEST")
+            self.append_journal("BUILD complete. All tasks checked off.")
+            self.git_commit("feat: all BUILD tasks complete")
+            return
+
+        task_id, task_title = unchecked[0][0].strip(), unchecked[0][1].strip()
+        await self.log(f"BUILD: {task_id}: {task_title}")
+        await self.push_state("current_task", f"{task_id}: {task_title}")
+
+        # Parse expected files up front — used by both PLAN fallback and EXECUTE branch
+        _tsect = re.search(
+            r'- \[ \] \*\*' + re.escape(task_id) + r'\*\*.*?(?=\n- \[|\Z)',
+            task_queue, re.DOTALL)
+        expected_files: list = []
+        if _tsect:
+            _fm = re.search(r'\*\*Files\*\*:(.+?)$', _tsect.group(), re.MULTILINE)
+            if _fm:
+                expected_files = re.findall(r'`(src/[^`]+\.ts)`', _fm.group(1))
+
+        brief          = self.read_brief()
+        manifest       = self.read_manifest()
+        journal_tail   = self.read_agent_file(JOURNAL_PATH, "")[-2000:]
+        current_plan   = self.read_agent_file(PLAN_PATH, "")
+        human_feedback = self.read_feedback()
+        if human_feedback:
+            await self.push_human_message(human_feedback)
+        chat_history = await self.fetch_chat_history()
+
+        src_tree = subprocess.run(
+            ["find", "src", "-type", "f", "-name", "*.ts"],
+            cwd=WORKSPACE_DIR, capture_output=True, text=True
+        ).stdout.strip()
+
+        if not current_plan:
+            # ── PLAN TURN ─────────────────────────────────────────────────
+            await self.log(f"BUILD: PLAN turn for {task_id}")
+            prompt = (
+                "You are a senior TypeScript/PixiJS game developer.\n"
+                "Produce a precise implementation plan for the next task.\n\n"
+                f"GAME: {manifest.get('name')} ({manifest.get('game_type')} / {manifest.get('art_style')})\n"
+                f"BRIEF: {brief[:800]}\n\n"
+                f"CURRENT TASK: **{task_id}**: {task_title}\n\n"
+                f"TASK QUEUE (context):\n{task_queue[:2000]}\n\n"
+                f"RECENT JOURNAL:\n{journal_tail}\n\n"
+                f"SOURCE FILE TREE:\n{src_tree}\n\n"
+                + (f"[HUMAN MESSAGE]\n{human_feedback}\n\n" if human_feedback else "")
+                + "Write an implementation plan between ```plan ... ``` fences:\n"
+                "- Exact files to create or modify (full src/ paths)\n"
+                "- Per-file: what changes and why\n"
+                "- New types/interfaces/exports needed\n"
+                "- Order of changes\n"
+                "- Acceptance criteria"
+            )
+
+            response = await self.prompt_gemma(prompt, temperature=0.4)
+            m = re.search(r'```plan\n(.*?)```', response, re.DOTALL)
+            plan_content = m.group(1).strip() if m else response.strip()
+            # Validate the plan actually mentions at least one source file
+            has_files = bool(re.search(r'src/\S+\.ts', plan_content))
+            if plan_content and has_files:
+                self.write_agent_file(PLAN_PATH, f"# Plan: {task_id} — {task_title}\n\n{plan_content}")
+                # Reset file-tracking for the new task's EXECUTE turns
+                written_path = os.path.join(AGENT_DIR, "task_written_files.json")
+                self.write_agent_file(written_path, "[]")
+                await self.log(f"BUILD: Plan written for {task_id}")
+                await self.push_action("plan", task_id)
+            else:
+                plan_retry_path = os.path.join(AGENT_DIR, "plan_retries.json")
+                pr = json.loads(open(plan_retry_path).read()) if os.path.exists(plan_retry_path) else {}
+                fail_count = pr.get(task_id, 0) + 1
+                pr[task_id] = fail_count
+                self.write_agent_file(plan_retry_path, json.dumps(pr))
+                await self.log(f"BUILD: PLAN turn bad output (attempt {fail_count}/3) — retrying.")
+                if fail_count >= 3:
+                    file_list = "\n".join(f"- Create/update `{f}`" for f in expected_files) if expected_files \
+                        else "- Implement this task from scratch."
+                    fallback = (
+                        f"## Task: {task_id} — {task_title}\n\n"
+                        f"Files to implement:\n{file_list}\n\n"
+                        f"Write correct TypeScript/PixiJS implementations for each file.\n"
+                        f"Ensure the build passes with `npx tsc --noEmit`."
+                    )
+                    self.write_agent_file(PLAN_PATH, f"# Plan: {task_id} — {task_title}\n\n{fallback}")
+                    written_path = os.path.join(AGENT_DIR, "task_written_files.json")
+                    self.write_agent_file(written_path, "[]")
+                    pr[task_id] = 0
+                    self.write_agent_file(plan_retry_path, json.dumps(pr))
+                    await self.log(f"BUILD: Auto-generated fallback plan for {task_id} after {fail_count} failed PLAN turns.")
+
+        else:
+            # ── EXECUTE TURN ──────────────────────────────────────────────
+            # expected_files already parsed above (before PLAN/EXECUTE branch)
+            written_path  = os.path.join(AGENT_DIR, "task_written_files.json")
+            written_files: list = json.loads(open(written_path).read()) if os.path.exists(written_path) else []
+            remaining     = [f for f in expected_files if f not in written_files]
+
+            # If all expected files are written, check build and auto-complete
+            if expected_files and not remaining:
+                _, out, err = await self.execute_native("npx tsc --noEmit 2>&1", timeout=120)
+                combined = (out + err).strip()
+                stuck_path  = os.path.join(AGENT_DIR, "stuck_files.json")
+                stuck_files = set(json.loads(open(stuck_path).read()) if os.path.exists(stuck_path) else [])
+                def _build_clean_local(tsc_output):
+                    if "error TS" not in tsc_output: return True
+                    return all(f in stuck_files for f in parse_ts_errors(tsc_output))
+                if _build_clean_local(combined):
+                    await self.log(f"BUILD: All files written, build clean — completing {task_id}.")
+                    return await self._complete_task(task_id, task_title, task_queue)
                 else:
-                    err_msg = "CRITICAL ERROR: No JSON object found in your output. You MUST wrap your tool calls in a valid JSON object like { \"thought\": \"...\", \"tool\": \"...\", ... }. Do not just talk; you must ACT."
-                    logger.warning(err_msg)
-                    await self.push_remote_log(err_msg)
-                    await self.push_agent_state("last_command_output", err_msg)
-            except Exception as e:
-                err_msg = f"Failed to parse or execute action: {e}"
-                logger.error(err_msg)
-                await self.push_remote_log(err_msg)
-                await self.push_agent_state("last_command_output", err_msg)
-            
-            # Update action history for loop detection
+                    # Real errors in newly written files — enter REPAIR to fix them
+                    await self.log(f"BUILD: Written files have errors — entering REPAIR.")
+                    await self.push_state("pre_repair_mode", "BUILD")
+                    self.set_mode("REPAIR")
+                    return
+
+            # Determine which file to write next
+            target_file = remaining[0] if remaining else (
+                # No expected_files in task_queue: ask Gemma to decide
+                None
+            )
+
+            await self.log(f"BUILD: EXECUTE turn for {task_id}" + (f" → {target_file}" if target_file else ""))
+
+            # Load current content of target file for context
+            current_content = ""
+            if target_file:
+                full = os.path.join(WORKSPACE_DIR, target_file)
+                if os.path.exists(full):
+                    current_content = open(full).read()
+                    if len(current_content) > 8000:
+                        current_content = current_content[:8000] + "\n...[TRUNCATED]..."
+
+            # Also load other files mentioned in the plan for context
+            mentioned = list(dict.fromkeys(re.findall(r'src/[\w/.-]+\.ts', current_plan)))
+            if target_file and target_file in mentioned:
+                mentioned.remove(target_file)
+            context_block = ""
+            for f in mentioned[:4]:
+                full = os.path.join(WORKSPACE_DIR, f)
+                if os.path.exists(full):
+                    content = open(full).read()
+                    if len(content) > 3000:
+                        content = content[:3000] + "\n...[TRUNCATED]..."
+                    context_block += f"\n{'='*50}\n{f}\n{'='*50}\n{content}\n"
+
+            last_cmd = self.read_last_output()[:1500]
+            stuck_path  = os.path.join(AGENT_DIR, "stuck_files.json")
+            stuck_files = json.loads(open(stuck_path).read()) if os.path.exists(stuck_path) else []
+            stuck_note  = (
+                "IMPORTANT: The following file(s) have known permanent errors — "
+                "IGNORE any TS errors reported for them:\n"
+                + "\n".join(f"  - {f}" for f in stuck_files)
+            ) if stuck_files else ""
+
+            if target_file:
+                # Code-fence mode: ask Gemma to write one specific file
+                # This avoids JSON truncation for large files entirely
+                prompt = (
+                    "You are a senior TypeScript/PixiJS game developer.\n"
+                    f"Write the complete implementation of `{target_file}`.\n"
+                    "Output ONLY a ```typescript code fence containing the full file.\n"
+                    "No JSON. No explanation. No text before or after the fence.\n\n"
+                    f"GAME: {manifest.get('name')} ({manifest.get('game_type')} / {manifest.get('art_style')})\n\n"
+                    + (f"{stuck_note}\n\n" if stuck_note else "")
+                    + f"IMPLEMENTATION PLAN:\n{current_plan}\n\n"
+                    + (f"CURRENT CONTENT OF {target_file}:\n{current_content}\n\n" if current_content else
+                       f"`{target_file}` does not exist yet — write from scratch.\n\n")
+                    + (f"OTHER FILES FOR CONTEXT:\n{context_block}\n\n" if context_block else "")
+                    + f"LAST BUILD OUTPUT:\n{last_cmd}\n"
+                    + (f"\n[HUMAN MESSAGE]\n{human_feedback}\n" if human_feedback else "")
+                )
+                response = await self.prompt_gemma(prompt, temperature=0.3, json_mode=False, max_tokens=8192)
+                new_code = extract_code_block(response)
+                if not new_code:
+                    await self.log(f"BUILD: No code fence in response for {target_file}.")
+                    await self.set_last_output(
+                        "ERROR: Output must be ONLY a ```typescript ... ``` code fence "
+                        f"containing the full implementation of {target_file}. No JSON, no prose.")
+                    return
+                # Brace-balance sanity check — after 3 mismatches write anyway and let REPAIR fix
+                if new_code.count('{') != new_code.count('}'):
+                    brace_fail_path = os.path.join(AGENT_DIR, "brace_failures.json")
+                    bf = json.loads(open(brace_fail_path).read()) if os.path.exists(brace_fail_path) else {}
+                    bf[target_file] = bf.get(target_file, 0) + 1
+                    self.write_agent_file(brace_fail_path, json.dumps(bf))
+                    if bf[target_file] >= 3:
+                        await self.log(f"BUILD: {bf[target_file]} brace mismatches for {target_file} — writing anyway, REPAIR will fix.")
+                        bf.pop(target_file, None)
+                        self.write_agent_file(brace_fail_path, json.dumps(bf))
+                        # fall through to write the file
+                    else:
+                        await self.log(f"BUILD: Brace mismatch in {target_file} (attempt {bf[target_file]}/3) — retrying.")
+                        await self.set_last_output(
+                            f"ERROR: Your output for {target_file} was truncated (brace mismatch). "
+                            "The file must be complete. Write a shorter implementation if needed.")
+                        return
+                full = os.path.join(WORKSPACE_DIR, target_file)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                open(full, 'w').write(new_code)
+                await self.log(f"BUILD: Wrote {target_file}")
+                await self.push_action("create_file", target_file)
+                if target_file not in written_files:
+                    written_files.append(target_file)
+                    self.write_agent_file(written_path, json.dumps(written_files))
+                _, out, err = await self.execute_native("npx tsc --noEmit 2>&1", timeout=120)
+                combined = (out + err).strip()
+                new_errors = combined.count('error TS')
+                await self.push_state("last_build_result", f"{new_errors} errors")
+                stuck_path_check = os.path.join(AGENT_DIR, "stuck_files.json")
+                stuck_set = set(json.loads(open(stuck_path_check).read()) if os.path.exists(stuck_path_check) else [])
+                def _clean(tsc):
+                    if "error TS" not in tsc: return True
+                    return all(f in stuck_set for f in parse_ts_errors(tsc))
+                remaining_now = [f for f in expected_files if f not in written_files]
+                if _clean(combined) and not remaining_now:
+                    await self.log(f"BUILD: All files written and build clean — auto-completing {task_id}.")
+                    return await self._complete_task(task_id, task_title, task_queue)
+                elif _clean(combined):
+                    await self.set_last_output(f"Wrote {target_file}. Build clean. Next: {remaining_now[0]}")
+                else:
+                    await self.set_last_output(f"Wrote {target_file}. Build errors:\n{combined[:2000]}")
+            else:
+                # No expected_files specified in task_queue — Gemma decides via JSON (small payload)
+                prompt = (
+                    "You are a senior TypeScript/PixiJS game developer implementing a game task.\n"
+                    "Respond with a SINGLE JSON object — no markdown, no prose.\n\n"
+                    f"GAME: {manifest.get('name')} ({manifest.get('game_type')} / {manifest.get('art_style')})\n\n"
+                    + (f"{stuck_note}\n\n" if stuck_note else "")
+                    + f"IMPLEMENTATION PLAN:\n{current_plan}\n\n"
+                    + (f"OTHER FILES:\n{context_block}\n\n" if context_block else "")
+                    + f"LAST OUTPUT:\n{last_cmd}\n\n"
+                    + (f"[HUMAN MESSAGE]\n{human_feedback}\n\n" if human_feedback else "")
+                    + 'Output: {"tool": "create_file", "filename": "src/...", "content": "..."} '
+                    'or {"tool": "run_build"} when done.'
+                )
+                response = await self.prompt_gemma(prompt, temperature=0.3, json_mode=True)
+                await self.log(f"Gemma output:\n{response[:300]}...")
+                action = self._parse_json_action(response)
+                if action:
+                    if action.get("thought"):
+                        await self.push_state("last_thought", action["thought"])
+                    # Clear consecutive JSON failure counter on success
+                    json_fail_path = os.path.join(AGENT_DIR, "execute_json_failures.json")
+                    if os.path.exists(json_fail_path):
+                        os.remove(json_fail_path)
+                    done = await self._dispatch_build_tool(action, task_id, task_title, task_queue, expected_files)
+                    if done:
+                        return await self._complete_task(task_id, task_title, task_queue)
+                else:
+                    await self.log("BUILD: No valid action in EXECUTE response.")
+                    json_fail_path = os.path.join(AGENT_DIR, "execute_json_failures.json")
+                    jf = json.loads(open(json_fail_path).read()) if os.path.exists(json_fail_path) else {"count": 0, "task": ""}
+                    if jf.get("task") != task_id:
+                        jf = {"count": 0, "task": task_id}
+                    jf["count"] += 1
+                    self.write_agent_file(json_fail_path, json.dumps(jf))
+                    if jf["count"] >= 3:
+                        await self.log(f"BUILD: {jf['count']} consecutive JSON parse failures in EXECUTE — clearing plan to re-plan.")
+                        if os.path.exists(PLAN_PATH):
+                            os.remove(PLAN_PATH)
+                        if os.path.exists(json_fail_path):
+                            os.remove(json_fail_path)
+                    else:
+                        await self.set_last_output(
+                            "ERROR: Respond with a single JSON object: "
+                            '{"tool": "create_file", "filename": "src/...", "content": "..."}')
+
+    async def _complete_task(self, task_id: str, task_title: str, task_queue: str):
+        """Mark task complete, commit, and clean up plan/written_files."""
+        if os.path.exists(PLAN_PATH):
+            os.remove(PLAN_PATH)
+        written_path = os.path.join(AGENT_DIR, "task_written_files.json")
+        if os.path.exists(written_path):
+            os.remove(written_path)
+        new_queue = re.sub(
+            r'- \[ \] \*\*' + re.escape(task_id) + r'\*\*',
+            f'- [x] **{task_id}**', task_queue, count=1)
+        self.write_agent_file(TASK_QUEUE_PATH, new_queue)
+        await self.log(f"BUILD: {task_id} complete!")
+        self.append_journal(f"BUILD: Completed {task_id} — {task_title}.")
+        self.git_commit(f"feat({task_id}): {task_title}")
+        await self.push_action("task_complete", task_id, "ok")
+
+        # Take a screenshot every 5 completed tasks so the Observation Deck shows progress
+        completed_count = len(re.findall(r'- \[x\]', self.read_agent_file(TASK_QUEUE_PATH) or ''))
+        if completed_count % 5 == 0:
+            shot_path = os.path.join(AGENT_DIR, "build_screenshot.png")
+            rc, _, _ = await self.execute_native(f"node capture_screenshot.js {shot_path}", timeout=30)
+            if os.path.exists(shot_path):
+                await self.push_screenshot(shot_path)
+                await self.log(f"BUILD: Screenshot captured at {completed_count} tasks complete.")
+
+    # ── Mode: PLAYTEST ────────────────────────────────────────────────────────
+
+    async def run_playtest_iteration(self, state: dict):
+        """Capture screenshot -> Gemma evaluates -> appends new tasks -> returns to BUILD."""
+        await self.log("PLAYTEST: Capturing screenshot...")
+        screenshot_path = os.path.join(AGENT_DIR, "playtest_screenshot.png")
+        console_path    = screenshot_path.replace('.png', '_console.json')
+        rc, out, err = await self.execute_native(f"node capture_screenshot.js {screenshot_path}", timeout=30)
+        has_screenshot = os.path.exists(screenshot_path)
+        if has_screenshot:
+            await self.push_screenshot(screenshot_path)
+
+        # Read console output captured by the screenshot script
+        console_note = ""
+        if os.path.exists(console_path):
             try:
-                # We store a string representation of the tool + params
-                current_action = f"{action.get('tool')}:{json.dumps(action.get('parameters') or action.get('params') or action.get('command') or action.get('query') or '')}"
-                self.action_history.append(current_action)
-                if len(self.action_history) > 5:
-                    self.action_history.pop(0)
-            except:
+                console_data = json.loads(open(console_path).read())
+                logs   = console_data.get('logs', [])
+                errors = console_data.get('errors', [])
+                if errors:
+                    console_note += "\nBROWSER ERRORS (uncaught exceptions / navigation failures):\n"
+                    console_note += "\n".join(f"  [{e['type']}] {e['text']}" for e in errors[:20])
+                if logs:
+                    # Only show warnings and errors from console, not routine logs
+                    important = [l for l in logs if l['type'] in ('error', 'warning', 'warn')]
+                    all_logs  = logs if not important else important
+                    console_note += f"\nBROWSER CONSOLE ({len(logs)} total messages, showing {'warnings/errors' if important else 'all'}):\n"
+                    console_note += "\n".join(f"  [{l['type']}] {l['text']}" for l in all_logs[:30])
+                if not logs and not errors:
+                    console_note = "\nBROWSER CONSOLE: No output recorded — the app may not be initialising at all."
+            except Exception:
                 pass
-            
-            # Success! Increment and save
-            self.iteration += 1
-            await self.push_agent_state("iteration_count", str(self.iteration))
-            
-            await asyncio.sleep(5) # Prevent ultra-fast looping in case of API failure
+
+        brief    = self.read_brief()
+        manifest = self.read_manifest()
+        task_queue = self.read_agent_file(TASK_QUEUE_PATH, "")
+        journal_tail = self.read_agent_file(JOURNAL_PATH, "")[-2000:]
+
+        # Count existing tasks to number new ones sequentially
+        existing_ids = re.findall(r'TASK-(\d+)', task_queue)
+        next_num = max((int(n) for n in existing_ids), default=0) + 1
+
+        screenshot_note = (
+            "A screenshot of the current game state has been captured and is shown above.\n"
+            if has_screenshot else
+            "NOTE: Screenshot capture failed — evaluate based on build status and journal only.\n"
+        )
+
+        prompt = (
+            "You are a game director doing a playtest review.\n"
+            f"{screenshot_note}\n"
+            + (f"{console_note}\n" if console_note else "")
+            + f"GAME: {manifest.get('name')} ({manifest.get('game_type')} / {manifest.get('art_style')})\n"
+            f"BRIEF:\n{brief[:600]}\n\n"
+            f"RECENT JOURNAL:\n{journal_tail}\n\n"
+            f"COMPLETED TASKS:\n{task_queue[:2000]}\n\n"
+            "Your job: identify what is visually broken, missing, or needs polish based on the screenshot and build history.\n"
+            "Generate 3-8 new actionable tasks to improve the game.\n\n"
+            f"Format each task (starting from TASK-{next_num:03d}):\n"
+            "- [ ] **TASK-NNN**: Short title\n"
+            "  - **Goal**: What this implements or fixes\n"
+            "  - **Files**: `src/...` full paths\n"
+            "  - **Depends on**: none\n"
+            "  - **Acceptance**: build passes / visual check\n\n"
+            "Output ONLY the new task markdown entries — no preamble, no explanation."
+        )
+
+        await self.log("PLAYTEST: Asking Gemma to evaluate and generate new tasks...")
+        response = await self.prompt_gemma(
+            prompt,
+            image_path=screenshot_path if has_screenshot else None,
+            temperature=0.5,
+            max_tokens=4096
+        )
+
+        # Extract task entries from the response
+        new_tasks = re.findall(r'- \[ \] \*\*TASK-\d+\*\*.*?(?=\n- \[ \]|\Z)', response, re.DOTALL)
+        if new_tasks:
+            appended = "\n" + "\n".join(t.strip() for t in new_tasks) + "\n"
+            self.write_agent_file(TASK_QUEUE_PATH, task_queue.rstrip() + appended)
+            await self.log(f"PLAYTEST: Appended {len(new_tasks)} new tasks to queue.")
+            self.append_journal(f"PLAYTEST: Generated {len(new_tasks)} new tasks after reviewing build.")
+            self.git_commit(f"chore: playtest review — {len(new_tasks)} new tasks added")
+        else:
+            # Gemma gave no tasks — log it but don't loop; append a generic polish task so BUILD has work
+            await self.log("PLAYTEST: No tasks extracted from Gemma's response. Adding generic polish task.")
+            fallback_num = f"{next_num:03d}"
+            fallback = (
+                f"\n- [ ] **TASK-{fallback_num}**: Polish and bug fixes\n"
+                f"  - **Goal**: Review all systems for runtime errors and visual polish\n"
+                f"  - **Files**: `src/client/core/CoreEngine.ts`\n"
+                f"  - **Depends on**: none\n"
+                f"  - **Acceptance**: game runs without console errors\n"
+            )
+            self.write_agent_file(TASK_QUEUE_PATH, task_queue.rstrip() + fallback)
+            self.append_journal("PLAYTEST: No tasks from Gemma, added fallback polish task.")
+
+        await self.log("PLAYTEST: Returning to BUILD.")
+        self.set_mode("BUILD")
+
+    # ── Tool dispatchers ──────────────────────────────────────────────────────
+
+    def _parse_json_action(self, response: str) -> dict:
+        """Extract last valid JSON object from Gemma's response."""
+        arr_m = re.search(r'\[\s*\{', response)
+        if arr_m:
+            start = response.find('[', arr_m.start())
+            end   = response.rfind(']') + 1
+            try:
+                arr = json.loads(response[start:end])
+                if isinstance(arr, list) and arr:
+                    return self._normalize_action(arr[-1])
+            except json.JSONDecodeError:
+                pass
+        for m in reversed(list(re.finditer(r'\{', response))):
+            start = m.start()
+            end   = response.rfind("}", start) + 1
+            try:
+                return self._normalize_action(json.loads(response[start:end]))
+            except json.JSONDecodeError:
+                continue
+        return {}
+
+    # File-write tool names Gemma may use
+    _FILE_WRITE_TOOLS = {
+        "create_file", "write_file", "write_to_file", "edit_file",
+        "update_file", "modify_file", "save_file", "overwrite_file",
+        "create_and_write", "write_code", "create_or_update_file",
+    }
+    # Build/complete tool names Gemma may use
+    _BUILD_TOOLS = {
+        "run_build", "build", "compile", "tsc", "type_check",
+        "complete_task", "task_complete", "finish_task", "done", "verify_build",
+    }
+
+    def _normalize_action(self, action: dict) -> dict:
+        """Normalize common Gemma hallucination patterns."""
+        if "tool" not in action and "action" in action:
+            action["tool"] = action["action"]
+        tool = action.get("tool", "")
+
+        # Normalize file-write variants → create_file
+        if tool in self._FILE_WRITE_TOOLS:
+            action["tool"] = "create_file"
+        # Normalize bash variants → run_bash
+        elif tool in ("bash", "execute_bash", "run_command", "terminal", "execute"):
+            action["tool"] = "run_bash"
+        # Normalize build variants → run_build
+        elif tool in self._BUILD_TOOLS:
+            action["tool"] = "run_build"
+
+        # Normalize path field: always ensure 'filename' exists for file tools
+        if action.get("tool") in ("create_file", "read_file"):
+            if not action.get("filename"):
+                action["filename"] = (
+                    action.get("path") or action.get("file") or
+                    action.get("filepath") or action.get("file_path") or
+                    action.get("dest") or action.get("target") or ""
+                )
+
+        # Unpack nested args/params/action_input
+        nested = action.get("args") or action.get("params") or action.get("parameters") or action.get("action_input") or {}
+        if isinstance(nested, dict) and nested:
+            t = action.get("tool")
+            if t == "run_bash" and not action.get("command"):
+                action["command"] = nested.get("command", "")
+            if t in ("read_file", "create_file") and not action.get("filename"):
+                action["filename"] = nested.get("path", nested.get("filename", ""))
+            if t == "create_file" and not action.get("content"):
+                action["content"] = (
+                    nested.get("content") or nested.get("file_content") or
+                    nested.get("text") or nested.get("code") or nested.get("source") or ""
+                )
+        return action
+
+    async def _dispatch_creative_tool(self, action: dict):
+        tool = action.get("tool", "")
+
+        if tool == "create_file":
+            fn, content = action.get("filename", ""), action.get("content", "")
+            if fn and content:
+                full = os.path.join(WORKSPACE_DIR, fn)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                open(full, 'w').write(content)
+                await self.log(f"Created: {fn}")
+                await self.push_action("create_file", fn)
+                await self.set_last_output(f"Created {fn}")
+
+        elif tool == "read_file":
+            fn = action.get("filename", "")
+            if fn:
+                full = os.path.join(WORKSPACE_DIR, fn)
+                try:
+                    content = open(full).read()[:40000]
+                    await self.set_last_output(f"Contents of {fn}:\n{content}")
+                    await self.push_action("read_file", fn)
+                except Exception as e:
+                    await self.set_last_output(f"Error reading {fn}: {e}")
+
+        elif tool == "run_bash":
+            cmd = action.get("command", "")
+            if cmd:
+                _, out, err = await self.execute_native(cmd)
+                await self.set_last_output((out + err).strip()[:8000])
+                await self.push_action("run_bash", cmd[:80])
+
+        elif tool == "chat_respond":
+            msg = action.get("message", action.get("content", action.get("text", "")))
+            if msg:
+                await self.push_chat(msg)
+                await self.push_action("chat_respond", msg[:80])
+
+        elif tool == "generate_image":
+            await self._handle_generate_image(action)
+
+        elif tool == "search_web":
+            query = action.get("query", "")
+            if query:
+                try:
+                    results = list(self.ddgs.text(query, max_results=3))
+                    await self.set_last_output(json.dumps(results)[:4000])
+                except Exception as e:
+                    await self.set_last_output(f"Search error: {e}")
+                await self.push_action("search_web", query[:80])
+
+        elif tool == "update_state":
+            for k in ("current_task", "overarching_goal"):
+                if k in action:
+                    await self.push_state(k, action[k])
+
+        elif tool == "add_reminder":
+            note = action.get("note", "")
+            if note:
+                await self._api("post", "/api/reminders", json={"note": note})
+
+        elif tool == "analyze_image":
+            fn = action.get("filename", "")
+            q  = action.get("question", "What do you see?")
+            full = os.path.join(WORKSPACE_DIR, fn)
+            if os.path.exists(full):
+                resp = await self.prompt_gemma(q, image_path=full)
+                await self.set_last_output(f"Analysis of {fn}:\n{resp}")
+            else:
+                await self.set_last_output(f"Image not found: {fn}")
+
+    async def _dispatch_build_tool(self, action: dict, task_id: str, task_title: str, task_queue: str, expected_files: list = None) -> bool:
+        """Dispatch BUILD tools. Returns True when the current task is complete (build clean)."""
+        tool = action.get("tool", "")
+        stuck_path  = os.path.join(AGENT_DIR, "stuck_files.json")
+        stuck_files = set(json.loads(open(stuck_path).read()) if os.path.exists(stuck_path) else [])
+
+        def _build_clean(tsc_output: str) -> bool:
+            """Build is 'clean enough' if all remaining errors are in stuck files."""
+            if "error TS" not in tsc_output:
+                return True
+            err_map = parse_ts_errors(tsc_output)
+            return all(f in stuck_files for f in err_map)
+
+        if tool == "create_file":  # all write variants normalized to this by _normalize_action
+            fn = action.get("filename") or action.get("path") or action.get("file") or ""
+            content = (
+                action.get("content") or action.get("file_content") or
+                action.get("text") or action.get("code") or ""
+            )
+            if not fn or not content:
+                # Tell Gemma exactly what was missing so she can correct her output
+                missing = []
+                if not fn:      missing.append("'filename' (or 'path')")
+                if not content: missing.append("'content'")
+                await self.set_last_output(
+                    f"ERROR: create_file requires {' and '.join(missing)}. "
+                    f"Got keys: {list(action.keys())}. "
+                    f"Output: {{\"tool\": \"create_file\", \"filename\": \"src/...\", \"content\": \"...\"}}"
+                )
+                await self.log(f"BUILD: create_file missing {missing} — sent feedback to Gemma.")
+                return False
+            full = os.path.join(WORKSPACE_DIR, fn)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            open(full, 'w').write(content)
+            await self.log(f"BUILD: Created {fn}")
+            await self.push_action("create_file", fn)
+            # Verify after every file write, give Gemma the error output as context
+            _, out, err = await self.execute_native("npx tsc --noEmit 2>&1", timeout=120)
+            combined = (out + err).strip()
+            new_errors = combined.count('error TS')
+            await self.push_state("last_build_result", f"{new_errors} errors")
+            # Track this file as written for the current task
+            written_path = os.path.join(AGENT_DIR, "task_written_files.json")
+            written = json.loads(open(written_path).read()) if os.path.exists(written_path) else []
+            if fn not in written:
+                written.append(fn)
+                self.write_agent_file(written_path, json.dumps(written))
+            if _build_clean(combined):
+                # Auto-complete if all expected files are now written
+                if expected_files:
+                    written_now = json.loads(open(written_path).read()) if os.path.exists(written_path) else []
+                    if all(f in written_now for f in expected_files):
+                        await self.log(f"BUILD: All expected files written and build clean — auto-completing {task_id}.")
+                        return True
+                    next_f = next((f for f in expected_files if f not in written_now), None)
+                    await self.set_last_output(f"Wrote {fn}. Build clean. Next: {next_f}")
+                else:
+                    # No explicit file list and build is clean — task is done
+                    await self.log(f"BUILD: Build clean after {fn} (no expected_files) — auto-completing {task_id}.")
+                    return True
+            else:
+                await self.set_last_output(f"Created {fn}. Build errors:\n{combined[:2000]}")
+            return False
+
+        elif tool == "run_build":  # all build variants normalized by _normalize_action
+            _, out, err = await self.execute_native("npx tsc --noEmit 2>&1", timeout=120)
+            combined = (out + err).strip()
+            count = combined.count("error TS")
+            await self.set_last_output(combined[:3000])
+            await self.push_state("last_build_result", f"{count} errors")
+            await self.push_action("run_build", f"{count} errors")
+            if _build_clean(combined):
+                return True
+
+        elif tool in ("run_tests", "test"):
+            _, out, err = await self.execute_native("CI=true npx vitest run 2>&1", timeout=120)
+            await self.set_last_output((out + err).strip()[:3000])
+            await self.push_action("run_tests", "vitest run")
+
+        elif tool == "chat_respond":
+            msg = action.get("message", action.get("content", ""))
+            if msg:
+                await self.push_chat(msg)
+
+        else:
+            # Unknown tool — give Gemma explicit feedback so she doesn't silently loop
+            await self.set_last_output(
+                f"ERROR: Unknown tool '{tool}'. Use: create_file (with 'filename' and 'content'), "
+                f"run_build, run_tests, chat_respond."
+            )
+            await self.log(f"BUILD: Unknown tool '{tool}' — gave feedback to Gemma.")
+
+        return False
+
+    # ── ComfyUI image generation ──────────────────────────────────────────────
+
+    async def _handle_generate_image(self, action: dict):
+        prompt_text = action.get("prompt", "")
+        filename    = action.get("filename", f"output_{self.iteration}.png")
+        model       = action.get("model", "illustriousXL_v01.safetensors")
+        width       = int(action.get("width", 1024))
+        height      = int(action.get("height", 512))
+        steps       = int(action.get("steps", 28))
+        cfg         = float(action.get("cfg", 7.5))
+        negative    = action.get("negative", "photorealistic, 3d render, blurry, text, watermark")
+
+        ckpt_dir = "/Users/max/ComfyUI/models/checkpoints/"
+        if not os.path.exists(os.path.join(ckpt_dir, model)):
+            model = ("illustriousXL_v01.safetensors"
+                     if os.path.exists(os.path.join(ckpt_dir, "illustriousXL_v01.safetensors"))
+                     else "sd_xl_base_1.0.safetensors")
+
+        out_dir  = os.path.join(WORKSPACE_DIR, "lore", "visuals", "generated")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path  = os.path.join(out_dir, filename)
+        comfy_url = "http://127.0.0.1:8188"
+
+        workflow = {
+            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model}},
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": prompt_text}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": negative}},
+            "4": {"class_type": "EmptyLatentImage",
+                  "inputs": {"width": width, "height": height, "batch_size": 1}},
+            "5": {"class_type": "KSampler",
+                  "inputs": {"model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
+                             "latent_image": ["4", 0], "seed": self.iteration,
+                             "steps": steps, "cfg": cfg,
+                             "sampler_name": "euler", "scheduler": "karras", "denoise": 1.0}},
+            "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+            "7": {"class_type": "SaveImage",
+                  "inputs": {"images": ["6", 0], "filename_prefix": os.path.splitext(filename)[0]}},
+        }
+
+        import uuid as _uuid
+        client_id = str(_uuid.uuid4())
+        await self.log(f"Generating image: {filename} (model={model})")
+        try:
+            async with aiohttp.ClientSession() as sess:
+                r = await sess.post(f"{comfy_url}/prompt",
+                                    json={"prompt": workflow, "client_id": client_id},
+                                    timeout=aiohttp.ClientTimeout(total=10))
+                prompt_id = (await r.json()).get("prompt_id")
+
+            for _ in range(300):
+                await asyncio.sleep(1)
+                async with aiohttp.ClientSession() as sess:
+                    hist_r = await sess.get(f"{comfy_url}/history/{prompt_id}",
+                                            timeout=aiohttp.ClientTimeout(total=5))
+                    hist = await hist_r.json()
+                if prompt_id in hist:
+                    for node_out in hist[prompt_id].get("outputs", {}).values():
+                        for img in node_out.get("images", []):
+                            async with aiohttp.ClientSession() as sess:
+                                ir = await sess.get(
+                                    f"{comfy_url}/view",
+                                    params={"filename": img["filename"],
+                                            "subfolder": img.get("subfolder", ""),
+                                            "type": "output"},
+                                    timeout=aiohttp.ClientTimeout(total=15))
+                                open(out_path, "wb").write(await ir.read())
+                            await self.push_screenshot(out_path)
+                            await self.log(f"Image saved: {filename}")
+                            await self.set_last_output(f"[IMAGE GENERATED]: lore/visuals/generated/{filename}")
+                            return
+                    break
+            await self.log("ComfyUI timed out.")
+        except Exception as e:
+            await self.log(f"ComfyUI error: {e}")
+            await self.set_last_output(f"[GENERATE ERROR]: {e}")
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    async def run_loop(self):
+        self.setup_signals()
+        await self.initialize_workspace()
+
+        state = await self.fetch_state()
+        if self.iteration == 0:
+            self.iteration = int(state.get("iteration_count", 0))
+
+        await self.log(f"Supervisor v2 started. Iteration {self.iteration}.")
+
+        while not self._shutdown:
+            try:
+                state    = await self.fetch_state()
+                manifest = self.read_manifest()
+                mode     = manifest.get("mode", "BOOTSTRAP")
+
+                await self.push_state("mode", mode)
+                await self.push_state("iteration_count", str(self.iteration))
+                logger.info(f"--- Iteration {self.iteration} | Mode: {mode} ---")
+                await self._api("post", "/api/logs",
+                                json={"log": f"--- Iteration {self.iteration} | Mode: {mode} ---"})
+
+                if self.iteration % 5 == 0:
+                    await self.sync_intel()
+                self._flush_ollama_if_needed()
+
+                if   mode == "BOOTSTRAP": await self.run_bootstrap()
+                elif mode == "CREATIVE":  await self.run_creative_iteration(state)
+                elif mode == "ARCHITECT": await self.run_architect()
+                elif mode == "BUILD":     await self.run_build_iteration(state)
+                elif mode == "REPAIR":    await self.run_repair_iteration(state)
+                elif mode == "PLAYTEST":  await self.run_playtest_iteration(state)
+                else:
+                    await self.log(f"Unknown mode '{mode}'. Defaulting to BUILD.")
+                    self.set_mode("BUILD")
+
+                self.iteration += 1
+                if not self._shutdown:
+                    await asyncio.sleep(2)
+
+            except Exception as e:
+                logger.error(f"Iteration {self.iteration} error: {e}", exc_info=True)
+                await self.log(f"Error: {e}")
+                await asyncio.sleep(5)
+
+        logger.info("Supervisor shutting down.")
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def _acquire_pid_lock():
+    if os.path.exists(PID_FILE):
+        try:
+            existing = int(open(PID_FILE).read().strip())
+            os.kill(existing, 0)
+            print(f"[ABORT] Supervisor already running (PID {existing}). Exiting.")
+            sys.exit(1)
+        except (OSError, ValueError):
+            pass
+    open(PID_FILE, 'w').write(str(os.getpid()))
+
+
+def _release_pid_lock():
+    try:
+        os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
+
 
 if __name__ == "__main__":
-    import atexit
-    import signal
-
-    PID_FILE = os.path.join(os.path.dirname(__file__), "supervisor.pid")
-
-    # --- PID Lock: prevent duplicate instances ---
-    def acquire_pid_lock():
-        if os.path.exists(PID_FILE):
-            try:
-                with open(PID_FILE, "r") as f:
-                    existing_pid = int(f.read().strip())
-                # Check if that process is actually running
-                os.kill(existing_pid, 0)  # Raises OSError if not running
-                print(f"[ABORT] Supervisor already running (PID {existing_pid}). Exiting.")
-                sys.exit(1)
-            except (OSError, ValueError):
-                # Stale PID file — process is dead, safe to overwrite
-                pass
-        with open(PID_FILE, "w") as f:
-            f.write(str(os.getpid()))
-
-    def release_pid_lock():
-        try:
-            os.remove(PID_FILE)
-        except FileNotFoundError:
-            pass
-
-    def handle_signal(signum, frame):
-        logger.info(f"Caught signal {signum}, shutting down cleanly.")
-        release_pid_lock()
-        sys.exit(0)
-
-    acquire_pid_lock()
-    atexit.register(release_pid_lock)
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
+    _acquire_pid_lock()
+    atexit.register(_release_pid_lock)
     supervisor = GemmaSupervisor()
-    asyncio.run(supervisor.run_loop())
+    try:
+        asyncio.run(supervisor.run_loop())
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt.")
+    finally:
+        _release_pid_lock()

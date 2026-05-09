@@ -207,6 +207,13 @@ async def api_get_screenshots(request):
     shots = [{"url": r["url"], "name": r["label"] or "", "timestamp": int(r["ts"])} for r in reversed(records)]
     return web.json_response({"screenshots": shots})
 
+async def api_clear_screenshots(request):
+    """Delete all screenshot history records (files on disk are left as-is)."""
+    if not db_pool: return web.json_response({'error': 'No DB'}, status=500)
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM screenshot_history')
+    return web.json_response({'status': 'ok'})
+
 async def api_get_state(request):
     """Get entire agent_state table."""
     if not db_pool: return web.json_response({"error": "No DB"}, status=500)
@@ -322,6 +329,7 @@ app.add_routes([
     web.post('/api/chat/response', api_push_chat_response),
     web.post('/api/screenshot', api_push_screenshot),
     web.get('/api/screenshots', api_get_screenshots),
+    web.delete('/api/screenshots', api_clear_screenshots),
     web.get('/api/state', api_get_state),
     web.post('/api/state', api_update_state),
     web.get('/api/reminders', api_get_reminders),

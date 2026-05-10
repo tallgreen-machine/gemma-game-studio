@@ -371,6 +371,30 @@ def assemble_task_card(target_file: str, errors: list, context_files: dict, brie
             + "```\n" + full_tsc_output[:3000] + ("\n...[TRUNCATED]" if len(full_tsc_output) > 3000 else "") + "\n```\n"
         )
 
+    # Inject art direction palette as named constants if available
+    palette_note = ""
+    palette_path = os.path.join(WORKSPACE_DIR, "lore", "art_direction", "palette.md")
+    if os.path.exists(palette_path):
+        try:
+            palette_content = open(palette_path).read()[:1200]
+            palette_note = (
+                "\nART DIRECTION PALETTE (use these exact hex values for any color constants):\n"
+                + palette_content + "\n"
+            )
+        except Exception:
+            pass
+
+    sprite_note = ""
+    sprite_path = os.path.join(WORKSPACE_DIR, "lore", "art_direction", "sprite_spec.md")
+    if os.path.exists(sprite_path):
+        try:
+            sprite_note = (
+                "\nSPRITE SPEC (use these exact dimensions for all sprite/tilemap loads):\n"
+                + open(sprite_path).read()[:800] + "\n"
+            )
+        except Exception:
+            pass
+
     # Detect framework from node_modules
     phaser_present = os.path.exists(os.path.join(WORKSPACE_DIR, "node_modules", "phaser"))
     framework_note = (
@@ -391,6 +415,8 @@ def assemble_task_card(target_file: str, errors: list, context_files: dict, brie
         + f"\nCONTEXT FILES (read-only):\n{context_block if context_block else '(none)'}\n"
         + f"\nFILE TO REWRITE:\n{'='*60}\n{target_file}\n{'='*60}\n{target_content}\n"
         + f"\nGAME CONTEXT: {brief[:400] if brief else 'A sci-fi side-scrolling RPG built with Phaser 3.'}\n"
+        + palette_note
+        + sprite_note
         + "\nOUTPUT RULES:\n"
         + "- Respond with ONLY a ```typescript ... ``` code fence\n"
         + "- No explanation, no commentary, no other text outside the fence\n"
@@ -895,8 +921,8 @@ class GemmaSupervisor:
 
         phase_complete = os.path.join(WORKSPACE_DIR, "lore", "PHASE_COMPLETE.md")
         if os.path.exists(phase_complete):
-            await self.log("PHASE_COMPLETE detected. Entering ARCHITECT.")
-            self.set_mode("ARCHITECT")
+            await self.log("PHASE_COMPLETE detected. Entering ART_DIRECTION.")
+            self.set_mode("ART_DIRECTION")
             return
 
         human_feedback = self.read_feedback()
@@ -990,6 +1016,17 @@ class GemmaSupervisor:
                         except Exception:
                             pass
 
+        # Read art direction specs — these make ARCHITECT tasks concrete
+        art_direction_content = ""
+        ad_dir = os.path.join(WORKSPACE_DIR, "lore", "art_direction")
+        for ad_file in ["palette.md", "sprite_spec.md", "asset_manifest.md"]:
+            ad_path = os.path.join(ad_dir, ad_file)
+            if os.path.exists(ad_path):
+                try:
+                    art_direction_content += f"\n### lore/art_direction/{ad_file}\n{open(ad_path).read()[:1200]}\n"
+                except Exception:
+                    pass
+
         tech_stack = manifest.get('tech_stack', 'phaser3')
         is_phaser = 'phaser' in tech_stack.lower()
         phaser_guidance = """
@@ -1024,7 +1061,8 @@ class GemmaSupervisor:
             f"SCOPE:      {manifest.get('scope', 'indie')}\n\n"
             f"EXISTING SOURCE FILES:\n{src_tree}\n\n"
             f"SPECS:\n{specs_content[:2000]}\n\n"
-            "Format each task EXACTLY like this:\n"
+            + (f"ART DIRECTION (use these exact values in tasks — filenames, hex codes, dimensions):\n{art_direction_content}\n\n" if art_direction_content else "")
+            + "Format each task EXACTLY like this:\n"
             "- [ ] **TASK-NNN**: Short title\n"
             "  - **Goal**: What this implements\n"
             "  - **Files**: Exact paths from project root (e.g. src/scenes/ZoneRuinsScene.ts)\n"
@@ -2162,12 +2200,13 @@ class GemmaSupervisor:
                     await self.sync_intel()
                 self._flush_ollama_if_needed()
 
-                if   mode == "BOOTSTRAP": await self.run_bootstrap()
-                elif mode == "CREATIVE":  await self.run_creative_iteration(state)
-                elif mode == "ARCHITECT": await self.run_architect()
-                elif mode == "BUILD":     await self.run_build_iteration(state)
-                elif mode == "REPAIR":    await self.run_repair_iteration(state)
-                elif mode == "PLAYTEST":  await self.run_playtest_iteration(state)
+                if   mode == "BOOTSTRAP":     await self.run_bootstrap()
+                elif mode == "CREATIVE":      await self.run_creative_iteration(state)
+                elif mode == "ART_DIRECTION": await self.run_art_direction()
+                elif mode == "ARCHITECT":     await self.run_architect()
+                elif mode == "BUILD":         await self.run_build_iteration(state)
+                elif mode == "REPAIR":        await self.run_repair_iteration(state)
+                elif mode == "PLAYTEST":      await self.run_playtest_iteration(state)
                 else:
                     await self.log(f"Unknown mode '{mode}'. Defaulting to BUILD.")
                     self.set_mode("BUILD")

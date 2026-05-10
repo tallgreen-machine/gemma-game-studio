@@ -988,6 +988,105 @@ class GemmaSupervisor:
         else:
             await self.log("No valid JSON action found.")
 
+    # ── Mode: ART_DIRECTION ───────────────────────────────────────────────────
+
+    async def run_art_direction(self):
+        """Multi-iteration phase: synthesise lore/visuals/ into a precise technical
+        art spec (palette, sprite dimensions, asset manifest, concept images).
+        Completes when Gemma writes lore/ART_DIRECTION_COMPLETE.md.
+        """
+        art_complete = os.path.join(WORKSPACE_DIR, "lore", "ART_DIRECTION_COMPLETE.md")
+        if os.path.exists(art_complete):
+            await self.log("ART_DIRECTION_COMPLETE detected. Entering ARCHITECT.")
+            self.set_mode("ARCHITECT")
+            return
+
+        brief    = self.read_brief()
+        manifest = self.read_manifest()
+
+        lore_tree = subprocess.run(
+            ["find", "lore", "-type", "f"],
+            cwd=WORKSPACE_DIR, capture_output=True, text=True
+        ).stdout.strip()
+
+        # Ingest up to 6 key visual docs as context
+        visuals_dir = os.path.join(WORKSPACE_DIR, "lore", "visuals")
+        visual_docs = ""
+        priority_docs = [
+            os.path.join(visuals_dir, "biome_palettes.md"),
+            os.path.join(visuals_dir, "STYLE_GUIDE_LUMINOUS_FORENSICISM.md"),
+            os.path.join(visuals_dir, "STYLE_DECISION.md"),
+            os.path.join(visuals_dir, "material_language.md"),
+            os.path.join(visuals_dir, "silhouette_language.md"),
+            os.path.join(visuals_dir, "architecture_silhouettes.md"),
+        ]
+        for p in priority_docs:
+            if os.path.exists(p) and len(visual_docs) < 4000:
+                try:
+                    visual_docs += f"\n### {os.path.basename(p)}\n{open(p).read()[:800]}\n"
+                except Exception:
+                    pass
+
+        # Check what art_direction files already exist
+        ad_dir = os.path.join(WORKSPACE_DIR, "lore", "art_direction")
+        ad_exists = os.listdir(ad_dir) if os.path.exists(ad_dir) else []
+
+        last_cmd = self.read_last_output()[:1500]
+
+        checklist = (
+            "\n[ART DIRECTION DELIVERABLES CHECKLIST]\n"
+            f"- lore/art_direction/palette.md         {'[DONE]' if 'palette.md' in ad_exists else '[TODO] — exact hex codes per zone + global UI palette'}\n"
+            f"- lore/art_direction/sprite_spec.md     {'[DONE]' if 'sprite_spec.md' in ad_exists else '[TODO] — pixel dimensions (player, tiles, enemies, parallax), animation frame counts, naming convention'}\n"
+            f"- lore/art_direction/asset_manifest.md  {'[DONE]' if 'asset_manifest.md' in ad_exists else '[TODO] — every asset filename BUILD tasks will reference (e.g. assets/sprites/player_walk.png)'}\n"
+            f"- Concept images (3+)                   {'[DONE]' if len([f for f in ad_exists if f.endswith('.png')]) >= 3 else '[TODO] — generate 3-5 key zone/character images via generate_image'}\n"
+            f"- lore/ART_DIRECTION_COMPLETE.md         [WRITE THIS LAST to advance to code phase]\n"
+        )
+
+        prompt = (
+            "[PHASE: ART_DIRECTION — TECHNICAL ART SPECIFICATION]\n\n"
+            f"You are the Art Director for **{manifest.get('name', 'Khoros')}**, "
+            f"a {manifest.get('game_type', 'side-scroller')} built in Phaser 3.\n\n"
+            "Your job is to translate the world's prose lore into a precise technical art "
+            "specification that an engineer can implement directly as code constants and asset loads.\n\n"
+            "## WHAT TO PRODUCE (in order):\n"
+            "1. **`lore/art_direction/palette.md`** — Every color as a named constant with hex code. "
+            "Format:\n   ```\n   RUST_ORANGE = #B7410E\n   VOID_SKY    = #A2CFFE\n   ```\n"
+            "   Organised by zone (Grounded_Lowlands, High_Voltage_Wastes, Static_Mists, Suture_Cities) plus UI palette.\n\n"
+            "2. **`lore/art_direction/sprite_spec.md`** — Technical sprite sheet specification:\n"
+            "   - Player: WxH in pixels, walk/run/jump/idle frame counts, spritesheet layout\n"
+            "   - Tiles: tile size in pixels (suggest 16x16 or 32x32), expected tileset dimensions\n"
+            "   - Parallax layers: how many per zone, each layer size in pixels (suggest 1920x600)\n"
+            "   - Named characters from the lore: size and animation frames for each\n"
+            "   - Naming convention: snake_case, zone prefix (e.g. `lowlands_player_walk.png`)\n\n"
+            "3. **`lore/art_direction/asset_manifest.md`** — Complete list of EVERY asset the game needs:\n"
+            "   - One entry per line: `assets/sprites/lowlands_player_walk.png  (32x48, 8 frames)`\n"
+            "   - Include: sprites, tilemaps, audio cues, UI elements, parallax layers\n\n"
+            "4. **3-5 concept images** using `generate_image`, saved to `lore/art_direction/`.\n"
+            "   Write highly specific ComfyUI prompts using the biome name, palette, lighting, silhouettes.\n\n"
+            "5. **`lore/ART_DIRECTION_COMPLETE.md`** — write LAST, only when all above are done.\n\n"
+            "## EXISTING VISUAL LORE (your raw material):\n"
+            f"{visual_docs}\n\n"
+            f"[LORE FILE TREE]\n{lore_tree}\n\n"
+            f"[LAST COMMAND OUTPUT]\n{last_cmd}\n\n"
+            f"[ART DIRECTION FILES SO FAR]: {ad_exists}\n"
+            f"{checklist}\n"
+            "Output ONE JSON action. Available tools: create_file, read_file, generate_image, run_bash, chat_respond.\n"
+            'Example: {"thought": "write the palette spec", "tool": "create_file", '
+            '"filename": "lore/art_direction/palette.md", "content": "..."}\n'
+        )
+
+        await self.log("Querying Gemma (ART_DIRECTION)...")
+        response = await self.prompt_gemma(prompt, num_ctx=12288)
+        await self.log(f"Gemma output:\n{response}")
+
+        action = self._parse_json_action(response)
+        if action:
+            if action.get("thought"):
+                await self.push_state("last_thought", action["thought"])
+            await self._dispatch_creative_tool(action)
+        else:
+            await self.log("ART_DIRECTION: No valid JSON action found.")
+
     # ── Mode: ARCHITECT ───────────────────────────────────────────────────────
 
     async def run_architect(self):

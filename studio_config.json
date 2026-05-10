@@ -1,0 +1,14 @@
+{
+  "active_game": "aetheria",
+  "games": {
+    "aetheria": {
+      "name": "Aetheria",
+      "style": "side-scroller",
+      "scale": "epic",
+      "multiplayer": "single",
+      "phase": "CREATIVE",
+      "tasks_complete": 83,
+      "created": "2026-04-01"
+    }
+  }
+}

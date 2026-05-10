@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+html = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -28,19 +28,7 @@
   .badge-build{background:#052e16;color:#86efac}
   .badge-repair{background:#431407;color:#fdba74}
   .badge-playtest{background:#0c4a6e;color:#7dd3fc}
-  .badge-paused{background:#451a03;color:#fbbf24}
-  .badge-architect{background:#1e3a5f;color:#93c5fd}
   .hidden{display:none!important}
-
-  /* ── SUPERVISOR STATUS ── */
-  .game-card.is-active{border-color:var(--accent2)}
-  .game-status-chip{position:absolute;top:12px;right:12px;font-size:10px;font-weight:700;
-    padding:2px 8px;border-radius:99px;letter-spacing:.05em}
-  .chip-running{background:#052e16;color:#86efac;border:1px solid #166534}
-  .chip-paused{background:#451a03;color:#fbbf24;border:1px solid #92400e}
-  .chip-idle{background:var(--border);color:var(--muted)}
-  .btn-warn{background:#b45309;color:#fff;border:none}
-  .btn-warn:hover{background:#92400e}
 
   /* ── AUTH ── */
   #page-auth{display:flex;align-items:center;justify-content:center;min-height:100vh;
@@ -231,10 +219,6 @@
         <button class="btn btn-ghost" onclick="showPage('games')" style="font-size:1.1rem;padding:4px 8px">&#8592;</button>
         <h2 id="studio-title">Studio</h2>
         <div class="badge badge-build" id="studio-phase-badge">BUILD</div>
-        <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
-          <div id="supervisor-status-pill" class="badge" style="font-size:11px"></div>
-          <button id="pause-resume-btn" class="btn btn-warn hidden" onclick="togglePause()">&#9646;&#9646; Pause</button>
-        </div>
       </div>
       <div class="stat-row">
         <div class="stat"><div class="label">Mode</div><div class="value" id="stat-mode">&#8212;</div></div>
@@ -307,8 +291,6 @@ const WS_URL = 'ws://' + location.host + '/ws';
 let ws = null;
 let activeGame = null;
 let state = {};
-let activeGameSlug = '';
-let supervisorStatus = 'offline'; // 'running' | 'paused' | 'offline'
 
 // ---- ROUTER ----
 function showPage(name) {
@@ -382,18 +364,8 @@ function connectWS() {
     else if (data.type === 'agent_chat') appendChat('agent', data.text);
     else if (data.type === 'human_chat') appendChat('human', data.text);
     else if (data.type === 'screenshot') appendShot(data.url, data.name);
-    else if (data.type === 'state') {
-      state[data.key] = data.value;
-      updateStats();
-      if (data.key === 'supervisor_status') updateSupervisorStatus(data.value);
-    }
-    else if (data.type === 'game_created') loadGames();
-    else if (data.type === 'game_switched') { activeGameSlug = data.slug || activeGameSlug; loadGames(); }
-    else if (data.type === 'active_game_changed') { activeGameSlug = data.slug; loadGames(); }
-    else if (data.type === 'supervisor_command') {
-      if (data.command === 'pause') updateSupervisorStatus('paused');
-      else if (data.command === 'resume') updateSupervisorStatus('running');
-    }
+    else if (data.type === 'state') { state[data.key] = data.value; updateStats(); }
+    else if (data.type === 'game_created' || data.type === 'game_switched') loadGames();
   };
   ws.onclose = function() { setTimeout(connectWS, 3000); };
 }
@@ -404,34 +376,19 @@ var STYLE_ICONS = {
   'isometric':'&#9876;','point-and-click':'&#128172;'
 };
 var PHASE_CLASS = {
-  'CREATIVE':'badge-creative','BUILD':'badge-build','REPAIR':'badge-repair',
-  'PLAYTEST':'badge-playtest','PAUSED':'badge-paused','ARCHITECT':'badge-architect'
+  'CREATIVE':'badge-creative','BUILD':'badge-build','REPAIR':'badge-repair','PLAYTEST':'badge-playtest'
 };
 
 async function loadGames() {
   var r = await fetch('/api/games');
   var data = await r.json();
   var games = data.games || [];
-  if (data.active_game) activeGameSlug = data.active_game;
   var grid = document.getElementById('games-grid');
   grid.innerHTML = '';
   games.forEach(function(g) {
-    var isActive = g.slug === activeGameSlug;
-    var chipHtml = '';
-    if (isActive) {
-      if (supervisorStatus === 'paused') {
-        chipHtml = '<div class="game-status-chip chip-paused">\u23f8 PAUSED</div>';
-      } else if (supervisorStatus === 'running') {
-        chipHtml = '<div class="game-status-chip chip-running">\u25b6 ACTIVE</div>';
-      } else {
-        chipHtml = '<div class="game-status-chip chip-idle">\u25cf ACTIVE</div>';
-      }
-    }
     var card = document.createElement('div');
-    card.className = 'game-card' + (isActive ? ' is-active' : '');
-    card.style.position = 'relative';
-    card.innerHTML = chipHtml +
-      '<div class="game-icon">' + (STYLE_ICONS[g.style] || '&#127918;') + '</div>' +
+    card.className = 'game-card';
+    card.innerHTML = '<div class="game-icon">' + (STYLE_ICONS[g.style] || '&#127918;') + '</div>' +
       '<h3>' + g.name + '</h3>' +
       '<div class="game-meta">' + g.style + ' &middot; ' + g.scale + ' scale &middot; ' + g.multiplayer + '</div>' +
       '<div><span class="badge ' + (PHASE_CLASS[g.phase] || 'badge-build') + '">' + g.phase + '</span></div>' +
@@ -448,14 +405,10 @@ async function loadGames() {
 
 async function openStudio(game) {
   activeGame = game;
-  // Only queue a switch command if this isn't already the active game
-  if (game.slug !== activeGameSlug) {
-    await fetch('/api/games/switch', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({slug: game.slug})
-    });
-    activeGameSlug = game.slug;
-  }
+  await fetch('/api/games/switch', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({slug: game.slug})
+  });
   document.getElementById('studio-title').textContent = game.name;
   document.getElementById('active-game-badge').textContent = game.name;
   document.getElementById('active-game-badge').classList.remove('hidden');
@@ -638,52 +591,16 @@ async function clearScreenshots() {
   document.getElementById('shots-grid').innerHTML = '';
 }
 
-function updateSupervisorStatus(status) {
-  supervisorStatus = status;
-  var pill = document.getElementById('supervisor-status-pill');
-  var btn = document.getElementById('pause-resume-btn');
-  if (!pill || !btn) return;
-  if (status === 'running') {
-    pill.textContent = '\u25b6 RUNNING';
-    pill.style.cssText = 'background:#052e16;color:#86efac;font-size:11px';
-    btn.innerHTML = '&#9646;&#9646; Pause';
-    btn.className = 'btn btn-warn';
-    btn.classList.remove('hidden');
-  } else if (status === 'paused') {
-    pill.textContent = '\u23f8 PAUSED';
-    pill.style.cssText = 'background:#451a03;color:#fbbf24;font-size:11px';
-    btn.textContent = '\u25b6 Resume';
-    btn.className = 'btn btn-primary';
-    btn.classList.remove('hidden');
-  } else {
-    pill.textContent = '\u25cb OFFLINE';
-    pill.style.cssText = 'background:var(--border);color:var(--muted);font-size:11px';
-    btn.classList.add('hidden');
-  }
-  loadGames(); // refresh cards to show current status chip
-}
-
-async function togglePause() {
-  if (supervisorStatus === 'running') {
-    await fetch('/api/studio/pause', {method:'POST'});
-    updateSupervisorStatus('paused'); // optimistic UI
-  } else if (supervisorStatus === 'paused') {
-    await fetch('/api/studio/resume', {method:'POST'});
-    updateSupervisorStatus('running'); // optimistic UI
-  }
-}
-
 function updateStats() {
-  document.getElementById('stat-mode').textContent = state.mode || '\u2014';
-  document.getElementById('stat-iter').textContent = state.iteration_count || '\u2014';
-  document.getElementById('stat-tasks').textContent = state.tasks_complete || '\u2014';
-  document.getElementById('stat-build').textContent = state.last_build_result || '\u2014';
+  document.getElementById('stat-mode').textContent = state.mode || '—';
+  document.getElementById('stat-iter').textContent = state.iteration_count || '—';
+  document.getElementById('stat-tasks').textContent = state.tasks_complete || '—';
+  document.getElementById('stat-build').textContent = state.last_build_result || '—';
   if (state.mode) {
     var badge = document.getElementById('studio-phase-badge');
     badge.textContent = state.mode;
     badge.className = 'badge ' + (PHASE_CLASS[state.mode] || 'badge-build');
   }
-  if (state.supervisor_status) updateSupervisorStatus(state.supervisor_status);
 }
 
 async function loadState() {
@@ -691,7 +608,6 @@ async function loadState() {
   var data = await r.json();
   state = data.state || {};
   updateStats();
-  if (state.supervisor_status) updateSupervisorStatus(state.supervisor_status);
 }
 
 async function loadChatHistory() {
@@ -762,4 +678,8 @@ function switchTab(name, btn) {
 bootAuth();
 </script>
 </body>
-</html>
+</html>"""
+
+with open('/Users/max/Repos/gemma_game_dev/dashboard/index.html', 'w') as f:
+    f.write(html)
+print('Written:', len(html.splitlines()), 'lines')

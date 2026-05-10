@@ -10,15 +10,14 @@
 #   REPAIR     → Structured Autonomous Repair (SAR): deterministic triage + LLM rewrite
 #   PLAYTEST   → Screenshot feedback → new tasks back into queue
 #
-# Memory (file-based, version-controlled in game_workspace/agent/):
+# Memory (file-based, per game in games/{active_game}/agent/):
 #   brief.md        — creative north star (from BOOTSTRAP)
 #   manifest.json   — technical config + current mode (source of truth)
 #   task_queue.md   — ordered task list (from ARCHITECT, updated by BUILD)
 #   journal.md      — decision log, appended after each completed task
 #   plan.md         — current PLAN turn output (consumed by EXECUTE turn)
 #
-# DB (crash recovery only — 5 keys max):
-#   mode, iteration_count, pre_repair_mode, repair_retries, last_build_result
+# Active game set in studio_config.json → { "active_game": "aetheria" }
 # =============================================================================
 
 import asyncio
@@ -40,17 +39,24 @@ logger = logging.getLogger("GemmaSupervisor")
 
 # ── Config
 ROOT_DIR      = os.path.dirname(os.path.abspath(__file__))
-WORKSPACE_DIR = os.path.join(ROOT_DIR, "game_workspace")
-AGENT_DIR     = os.path.join(WORKSPACE_DIR, "agent")
 FEEDBACK_PATH = os.path.join(ROOT_DIR, "human_feedback.md")
 PID_FILE      = os.path.join(ROOT_DIR, "supervisor.pid")
+
+# ── Active game — read from studio_config.json
+_studio_config_path = os.path.join(ROOT_DIR, "studio_config.json")
+_studio_config      = json.loads(open(_studio_config_path).read()) if os.path.exists(_studio_config_path) else {}
+ACTIVE_GAME         = _studio_config.get("active_game", "aetheria")
+GAMES_DIR           = os.path.join(ROOT_DIR, "games")
+WORKSPACE_DIR       = os.path.join(GAMES_DIR, ACTIVE_GAME)
+AGENT_DIR           = os.path.join(WORKSPACE_DIR, "agent")
+logger.info(f"Active game: {ACTIVE_GAME} @ {WORKSPACE_DIR}")
 
 OLLAMA_URL    = "http://localhost:11434/api/generate"
 MODEL_NAME    = "gemma4:31b"
 DROPLET_IP    = "165.227.27.71"
 API_KEY       = "epiphany_secret_2026"
 
-# Agent memory paths
+# Agent memory paths (scoped to active game)
 BRIEF_PATH      = os.path.join(AGENT_DIR, "brief.md")
 MANIFEST_PATH   = os.path.join(AGENT_DIR, "manifest.json")
 TASK_QUEUE_PATH = os.path.join(AGENT_DIR, "task_queue.md")
@@ -117,7 +123,30 @@ def build_repair_order(error_map: dict) -> list:
     return sorted(files, key=lambda f: (0 if f in imported_by_errored else 1, -len(error_map[f])))
 
 
-TRIVIAL_CODES = {'TS2551', 'TS2552', 'TS2564', 'TS7006', 'TS2307', 'TS2724'}
+TRIVIAL_CODES = {'TS2551', 'TS2552', 'TS2564', 'TS7006', 'TS2307', 'TS2724', 'TS2693'}
+
+# PixiJS v7/v8: BLEND_MODES enum was replaced with string literals
+PIXI_BLEND_MODE_MAP = {
+    'BLEND_MODES.NORMAL': "'normal'",
+    'BLEND_MODES.ADD': "'add'",
+    'BLEND_MODES.MULTIPLY': "'multiply'",
+    'BLEND_MODES.SCREEN': "'screen'",
+    'BLEND_MODES.OVERLAY': "'overlay'",
+    'BLEND_MODES.DARKEN': "'darken'",
+    'BLEND_MODES.LIGHTEN': "'lighten'",
+    'BLEND_MODES.COLOR_DODGE': "'color-dodge'",
+    'BLEND_MODES.COLOR_BURN': "'color-burn'",
+    'BLEND_MODES.HARD_LIGHT': "'hard-light'",
+    'BLEND_MODES.SOFT_LIGHT': "'soft-light'",
+    'BLEND_MODES.DIFFERENCE': "'difference'",
+    'BLEND_MODES.EXCLUSION': "'exclusion'",
+    'BLEND_MODES.HUE': "'hue'",
+    'BLEND_MODES.SATURATION': "'saturation'",
+    'BLEND_MODES.COLOR': "'color'",
+    'BLEND_MODES.LUMINOSITY': "'luminosity'",
+    'BLEND_MODES.NONE': "'none'",
+    'BLEND_MODES.ERASE': "'erase'",
+}
 
 
 def _find_module_in_workspace(import_spec: str) -> str | None:
@@ -218,6 +247,24 @@ def attempt_trivial_fixes(filepath: str, errors: list) -> tuple:
                         if new_line != line:
                             lines[li] = new_line
                             changed = True
+
+        elif err['code'] == 'TS2693':
+            # "'X' only refers to a type, but is being used as a value here"
+            # Known case: BLEND_MODES used as runtime enum — replace with string literals
+            type_m = re.search(r"'(\w+)' only refers to a type", err['message'])
+            if type_m and type_m.group(1) == 'BLEND_MODES':
+                content = ''.join(lines)
+                new_content = content
+                for old, new in PIXI_BLEND_MODE_MAP.items():
+                    new_content = new_content.replace(old, new)
+                # Remove the type-only BLEND_MODES import if no more usages remain
+                new_content = re.sub(r',\s*BLEND_MODES', '', new_content)
+                new_content = re.sub(r'BLEND_MODES\s*,\s*', '', new_content)
+                new_content = re.sub(r"import\s*\{\s*\}\s*from\s*'pixi\.js';?\n?", '', new_content)
+                if new_content != content:
+                    lines = [new_content]
+                    changed = True
+                    break
 
     result = lines[0] if len(lines) == 1 and isinstance(lines[0], str) and '\n' in lines[0] else ''.join(lines)
     return changed, result
@@ -324,15 +371,26 @@ def assemble_task_card(target_file: str, errors: list, context_files: dict, brie
             + "```\n" + full_tsc_output[:3000] + ("\n...[TRUNCATED]" if len(full_tsc_output) > 3000 else "") + "\n```\n"
         )
 
+    # Detect framework from node_modules
+    phaser_present = os.path.exists(os.path.join(WORKSPACE_DIR, "node_modules", "phaser"))
+    framework_note = (
+        "This is a Phaser 3 game. Use `import Phaser from 'phaser'`.\n"
+        "Scenes extend Phaser.Scene. Never use PixiJS or CoreEngine/GameSystem patterns.\n"
+        "Phaser API: this.physics, this.add, this.input, this.cameras, this.load, this.scene\n"
+    ) if phaser_present else (
+        "This is a TypeScript game using PixiJS. Use `import * as PIXI from 'pixi.js'`.\n"
+    )
+
     return (
-        "You are a TypeScript expert fixing compile errors in a PixiJS game.\n"
+        "You are a TypeScript expert fixing compile errors.\n"
+        + framework_note
         + retry_note
         + tsc_block
         + f"\nTASK: Rewrite `{target_file}` to fix all {len(errors)} errors listed below.\n"
         + f"\nERRORS TO FIX:\n{error_block}\n"
         + f"\nCONTEXT FILES (read-only):\n{context_block if context_block else '(none)'}\n"
         + f"\nFILE TO REWRITE:\n{'='*60}\n{target_file}\n{'='*60}\n{target_content}\n"
-        + f"\nGAME CONTEXT: {brief[:400] if brief else 'A sci-fi RPG built with TypeScript and PixiJS.'}\n"
+        + f"\nGAME CONTEXT: {brief[:400] if brief else 'A sci-fi side-scrolling RPG built with Phaser 3.'}\n"
         + "\nOUTPUT RULES:\n"
         + "- Respond with ONLY a ```typescript ... ``` code fence\n"
         + "- No explanation, no commentary, no other text outside the fence\n"
@@ -399,32 +457,35 @@ def lookup_conflicting_type_hints(target_file: str, errors: list) -> str:
 
 
 def lookup_pixi_type_hints(errors: list) -> str:
-    """For TS2339 'property does not exist on type X' errors, find the actual
-    PixiJS type definition and return it as a hint block for Gemma."""
-    # Extract unique type names from TS2339 errors
+    """For TS2339 'property does not exist on type X' errors, look up the
+    actual type definition (Phaser or PixiJS) and return it as a hint block."""
     type_names = set()
     for e in errors:
         if e['code'] == 'TS2339':
             m = re.search(r"does not exist on type '([^']+)'", e['message'])
             if m:
-                # Strip generic params: ColorMatrixFilter<X> -> ColorMatrixFilter
                 type_names.add(re.sub(r'<.*>', '', m.group(1)).strip())
 
     if not type_names:
         return ""
 
-    pixi_dts = os.path.join(WORKSPACE_DIR, "node_modules", "pixi.js", "dist", "pixi.js.d.ts")
-    if not os.path.exists(pixi_dts):
+    # Try Phaser 3 type definitions first
+    phaser_dts = os.path.join(WORKSPACE_DIR, "node_modules", "phaser", "types", "phaser.d.ts")
+    # Fallback to PixiJS
+    pixi_dts   = os.path.join(WORKSPACE_DIR, "node_modules", "pixi.js", "dist", "pixi.js.d.ts")
+    dts_path   = phaser_dts if os.path.exists(phaser_dts) else (pixi_dts if os.path.exists(pixi_dts) else None)
+    framework  = "Phaser" if os.path.exists(phaser_dts) else "PixiJS"
+
+    if not dts_path:
         return ""
 
     try:
-        dts_content = open(pixi_dts).read()
+        dts_content = open(dts_path).read()
     except Exception:
         return ""
 
     hints = []
     for type_name in sorted(type_names):
-        # Find the class/interface declaration
         m = re.search(
             r'(?:export\s+)?(?:declare\s+)?(?:class|interface)\s+' + re.escape(type_name) + r'\b[^{]*\{',
             dts_content
@@ -432,12 +493,11 @@ def lookup_pixi_type_hints(errors: list) -> str:
         if not m:
             continue
         start = m.start()
-        # Extract up to 60 lines of the declaration
         block_lines = dts_content[start:start + 4000].splitlines()[:60]
         block = '\n'.join(block_lines)
-        hints.append(f"// PixiJS type definition for {type_name}:\n{block}\n// ... (see full definition in node_modules)")
+        hints.append(f"// {framework} type definition for {type_name}:\n{block}\n// ... (see full definition in node_modules)")
 
-    return ("\nPIXIJS TYPE REFERENCE (use these exact method/property names):\n"
+    return (f"\n{framework.upper()} TYPE REFERENCE (use these exact method/property names):\n"
             + "\n\n".join(hints) + "\n") if hints else ""
 
 
@@ -480,6 +540,7 @@ class GemmaSupervisor:
         self.iteration = 0
         self.ddgs = DDGS()
         self._shutdown = False
+        self._paused = False
 
     # ── Signals ───────────────────────────────────────────────────────────────
 
@@ -510,14 +571,14 @@ class GemmaSupervisor:
                 process.kill()
             return 1, "", f"Command timed out after {timeout}s."
 
-    async def prompt_gemma(self, prompt: str, image_path: str = None, temperature: float = 0.7, json_mode: bool = False, max_tokens: int = 4096) -> str:
+    async def prompt_gemma(self, prompt: str, image_path: str = None, temperature: float = 0.7, json_mode: bool = False, max_tokens: int = 4096, num_ctx: int = 32768) -> str:
         import base64
         payload = {
             "model": MODEL_NAME,
             "prompt": prompt,
             "stream": False,
             "options": {
-                "num_ctx": 32768,
+                "num_ctx": num_ctx,
                 "num_predict": max_tokens,
                 "temperature": temperature,
                 "top_p": 0.9,
@@ -814,7 +875,7 @@ class GemmaSupervisor:
             "Be specific, evocative, and concrete. Output only the markdown."
         )
 
-        response = await self.prompt_gemma(synthesis_prompt, temperature=0.7)
+        response = await self.prompt_gemma(synthesis_prompt, temperature=0.7, num_ctx=4096)
         brief = response.strip() if response.strip() else \
                 "\n".join(f"## {k.title()}\n{v}" for k, v in answers.items())
         self.write_agent_file(BRIEF_PATH, brief)
@@ -870,8 +931,16 @@ class GemmaSupervisor:
             + f"[LAST THOUGHT]\n{last_thought}\n\n"
             f"Iteration {self.iteration}. Think freely, then output ONE JSON action.\n\n"
             "Available tools: create_file, read_file, run_bash, chat_respond, update_state, "
-            "add_reminder, generate_image, search_web, analyze_image.\n"
-            'Declare creative phase complete: {"thought": "ready", "tool": "create_file", '
+            "add_reminder, generate_image, search_web, analyze_image.\n\n"
+            "[CREATIVE PHASE — TWO PARTS]\n"
+            "PART 1 — LORE: Write world-building documents until the world feels complete.\n"
+            "PART 2 — VISUAL SCAFFOLD: Write minimal Phaser 3 TypeScript 'mood scenes' for each major zone.\n"
+            "  A mood scene renders ONLY atmosphere: sky gradient, parallax layers, zone color palette, placeholder geometry.\n"
+            "  Save to: src/scenes/mood/ZoneXxxMood.ts\n"
+            "  After writing a mood scene, run it with run_bash: \"npx tsc --noEmit 2>&1\"\n"
+            "  These become the visual skeleton BUILD tasks will flesh out.\n\n"
+            "Declare creative phase complete (after lore AND at least 3 mood scenes): "
+            '{"thought": "ready", "tool": "create_file", '
             '"filename": "lore/PHASE_COMPLETE.md", "content": "Creative phase complete."}\n'
             'Example: {"thought": "write the creation myth", "tool": "create_file", '
             '"filename": "lore/world/creation_myth.md", "content": "..."}\n'
@@ -882,7 +951,7 @@ class GemmaSupervisor:
             prompt += f"\n[PORTFOLIO UPDATE — ITER {self.iteration}]: Update lore/presentations/presentation_current.md.\n"
 
         await self.log("Querying Gemma (CREATIVE)...")
-        response = await self.prompt_gemma(prompt)
+        response = await self.prompt_gemma(prompt, num_ctx=16384)
         await self.log(f"Gemma output:\n{response}")
 
         action = self._parse_json_action(response)
@@ -921,30 +990,55 @@ class GemmaSupervisor:
                         except Exception:
                             pass
 
+        tech_stack = manifest.get('tech_stack', 'phaser3')
+        is_phaser = 'phaser' in tech_stack.lower()
+        phaser_guidance = """
+## Phaser 3 Architecture (REQUIRED — follow exactly)
+- Entry: `src/main.ts` — creates `new Phaser.Game(config)` with scene array
+- Scenes live in `src/scenes/`. One file per scene. Each extends `Phaser.Scene`.
+  - `BootScene.ts`    — config only, starts PreloadScene
+  - `PreloadScene.ts` — all asset loads via this.load.*, starts GameScene
+  - `GameScene.ts`    — hub/overworld or main zone
+  - `ZoneXxxScene.ts` — one per world zone (e.g. ZoneRuinsScene.ts)
+  - `UIScene.ts`      — parallel HUD scene (launched with mode: 'parallel')
+  - `DialogueScene.ts` — NPC dialogue overlay
+- Physics: arcade (gravity in main config). `this.physics.add.sprite/group/collider`
+- Assets: `this.load.image/tilemapTiledJSON/audio` in PreloadScene preload()
+- Camera: `this.cameras.main.setBounds().startFollow(player)`
+- Input: `this.input.keyboard.createCursorKeys()` or `addKeys()`
+- NPC souls: `data/souls/npc_name.json` — read via fetch() or Vite import
+- NEVER import PixiJS. NEVER reference old CoreEngine/MovementSystem classes.
+- Build check: `npx tsc --noEmit` must pass with zero errors.
+- File size: max 400 lines per file. Split into helper modules if needed.
+""" if is_phaser else ""
+
         await self.log("ARCHITECT: Gemma designing task_queue.md...")
         prompt = (
             "You are a senior game developer and architect.\n"
-            "Design a complete ordered task queue for building this game.\n\n"
+            "Design a complete ordered task queue for building this game with Phaser 3.\n\n"
+            f"{phaser_guidance}\n"
             f"GAME BRIEF:\n{brief[:1500]}\n\n"
-            f"TECH STACK: {manifest.get('tech_stack', 'typescript_pixijs')}\n"
+            f"TECH STACK: {tech_stack}\n"
             f"GAME TYPE:  {manifest.get('game_type')}\n"
             f"ART STYLE:  {manifest.get('art_style')}\n"
             f"SCOPE:      {manifest.get('scope', 'indie')}\n\n"
             f"EXISTING SOURCE FILES:\n{src_tree}\n\n"
             f"SPECS:\n{specs_content[:2000]}\n\n"
-            "Format each task:\n"
+            "Format each task EXACTLY like this:\n"
             "- [ ] **TASK-NNN**: Short title\n"
             "  - **Goal**: What this implements\n"
-            "  - **Files**: Full paths from src/ to create or modify\n"
+            "  - **Files**: Exact paths from project root (e.g. src/scenes/ZoneRuinsScene.ts)\n"
             "  - **Depends on**: TASK-NNN or none\n"
-            "  - **Acceptance**: build passes / test passes / visual check\n\n"
-            "Start with foundational systems, then gameplay, then UI, then polish.\n"
-            f"Aim for 15-25 tasks for a {manifest.get('scope','indie')}-scope "
+            "  - **Acceptance**: build passes / screenshot looks correct / NPC responds\n\n"
+            "Task ordering: BootScene → PreloadScene → GameScene hub → first playable zone → "
+            "player physics → UI/HUD → NPC dialogue → additional zones → polish.\n"
+            f"Aim for 20-40 tasks for an {manifest.get('scope','epic')}-scope "
             f"{manifest.get('game_type','')} game.\n"
+            "Name zone scenes after real places from the game's lore (from lore/ directory).\n"
             "Output only the task_queue.md markdown."
         )
 
-        response = await self.prompt_gemma(prompt, temperature=0.4)
+        response = await self.prompt_gemma(prompt, temperature=0.4, num_ctx=8192)
         if response.strip():
             self.write_agent_file(TASK_QUEUE_PATH, response.strip())
             await self.log("task_queue.md written. Entering BUILD.")
@@ -961,16 +1055,16 @@ class GemmaSupervisor:
                 # Auto-generate a minimal task queue so BUILD can start
                 minimal_queue = (
                     "# Task Queue\n\n"
-                    "- [ ] **TASK-001**: Initialize PixiJS application\n"
-                    "  - **Goal**: Set up PixiJS app, stage, and main game loop\n"
-                    "  - **Files**: `src/client/main.ts`\n"
+                    "- [ ] **TASK-001**: Bootstrap Phaser 3 entry point\n"
+                    "  - **Goal**: src/main.ts creates Phaser.Game with BootScene, PreloadScene, GameScene\n"
+                    "  - **Files**: `src/main.ts`, `src/scenes/BootScene.ts`, `src/scenes/PreloadScene.ts`\n"
                     "  - **Depends on**: none\n"
-                    "  - **Acceptance**: build passes\n\n"
-                    "- [ ] **TASK-002**: Implement core engine\n"
-                    "  - **Goal**: CoreEngine class managing all game systems\n"
-                    "  - **Files**: `src/client/core/CoreEngine.ts`\n"
+                    "  - **Acceptance**: build passes, blank canvas visible\n\n"
+                    "- [ ] **TASK-002**: GameScene hub — player spawn and first zone\n"
+                    "  - **Goal**: GameScene with arcade physics, placeholder player sprite, ground collider, camera follow\n"
+                    "  - **Files**: `src/scenes/GameScene.ts`\n"
                     "  - **Depends on**: TASK-001\n"
-                    "  - **Acceptance**: build passes\n"
+                    "  - **Acceptance**: player falls onto ground, arrow keys move them\n"
                 )
                 self.write_agent_file(TASK_QUEUE_PATH, minimal_queue)
                 if os.path.exists(arch_retry_path):
@@ -1075,11 +1169,11 @@ class GemmaSupervisor:
             previous_new_errors = json.loads(open(prev_err_path).read()) if os.path.exists(prev_err_path) else None
             task_card = assemble_task_card(target_file, errors, context_files, brief, retry, previous_new_errors, full_tsc_output=combined) + pixi_hints + conflict_hints
             if pixi_hints:
-                await self.log(f"REPAIR: Injected PixiJS type hints for {target_file}.")
+                await self.log(f"REPAIR: Injected framework type hints for {target_file}.")
             if conflict_hints:
                 await self.log(f"REPAIR: Injected type-conflict hints for {target_file}.")
         await self.log(f"REPAIR: Calling Gemma for {target_file} ({len(context_files)} ctx files, retry={retry}, nuke={'yes' if target_file in nuke_files else 'no'})...")
-        response = await self.prompt_gemma(task_card, temperature=0.2, max_tokens=8192)
+        response = await self.prompt_gemma(task_card, temperature=0.2, max_tokens=8192, num_ctx=16384)
 
         # Step 4: extract code block
         new_code = extract_code_block(response)
@@ -1111,6 +1205,16 @@ class GemmaSupervisor:
             await self.log(f"REPAIR: Sanity fail — missing exports {missing}. Incrementing retry.")
             retry_counts[target_file] = retry + 1
             self.write_repair_retries(retry_counts)
+            if retry_counts[target_file] >= MAX_RETRIES:
+                stuck_files.add(target_file)
+                self.write_agent_file(stuck_path, json.dumps(list(stuck_files)))
+                retry_counts.pop(target_file, None)
+                self.write_repair_retries(retry_counts)
+                await self.log(f"REPAIR: {target_file} auto-marked stuck after {MAX_RETRIES} sanity failures — skipping.")
+                self.append_journal(f"REPAIR: Auto-stuck {target_file} after {MAX_RETRIES} sanity failures.")
+                await self.push_chat(
+                    f"⚠️ REPAIR: Auto-skipped `{target_file}` after {MAX_RETRIES} sanity failures. "
+                    f"Added to stuck_files.json — continuing.")
             return
 
         # Step 5b: brace-balance check — reject truncated output
@@ -1120,6 +1224,16 @@ class GemmaSupervisor:
             await self.log(f"REPAIR: Brace mismatch ({open_braces} open vs {close_braces} close) — likely truncated. Incrementing retry.")
             retry_counts[target_file] = retry + 1
             self.write_repair_retries(retry_counts)
+            if retry_counts[target_file] >= MAX_RETRIES:
+                stuck_files.add(target_file)
+                self.write_agent_file(stuck_path, json.dumps(list(stuck_files)))
+                retry_counts.pop(target_file, None)
+                self.write_repair_retries(retry_counts)
+                await self.log(f"REPAIR: {target_file} auto-marked stuck after {MAX_RETRIES} brace mismatches — skipping.")
+                self.append_journal(f"REPAIR: Auto-stuck {target_file} after {MAX_RETRIES} brace mismatches.")
+                await self.push_chat(
+                    f"⚠️ REPAIR: Auto-skipped `{target_file}` after {MAX_RETRIES} brace mismatches. "
+                    f"Added to stuck_files.json — continuing.")
             return
 
         # Step 6: write new content
@@ -1308,7 +1422,7 @@ class GemmaSupervisor:
                 "- Acceptance criteria"
             )
 
-            response = await self.prompt_gemma(prompt, temperature=0.4)
+            response = await self.prompt_gemma(prompt, temperature=0.4, num_ctx=8192)
             m = re.search(r'```plan\n(.*?)```', response, re.DOTALL)
             plan_content = m.group(1).strip() if m else response.strip()
             # Validate the plan actually mentions at least one source file
@@ -1425,7 +1539,7 @@ class GemmaSupervisor:
                     + f"LAST BUILD OUTPUT:\n{last_cmd}\n"
                     + (f"\n[HUMAN MESSAGE]\n{human_feedback}\n" if human_feedback else "")
                 )
-                response = await self.prompt_gemma(prompt, temperature=0.3, json_mode=False, max_tokens=8192)
+                response = await self.prompt_gemma(prompt, temperature=0.3, json_mode=False, max_tokens=8192, num_ctx=32768)
                 new_code = extract_code_block(response)
                 if not new_code:
                     await self.log(f"BUILD: No code fence in response for {target_file}.")
@@ -1489,7 +1603,7 @@ class GemmaSupervisor:
                     + 'Output: {"tool": "create_file", "filename": "src/...", "content": "..."} '
                     'or {"tool": "run_build"} when done.'
                 )
-                response = await self.prompt_gemma(prompt, temperature=0.3, json_mode=True)
+                response = await self.prompt_gemma(prompt, temperature=0.3, json_mode=True, num_ctx=8192)
                 await self.log(f"Gemma output:\n{response[:300]}...")
                 action = self._parse_json_action(response)
                 if action:
@@ -1618,7 +1732,8 @@ class GemmaSupervisor:
             prompt,
             image_path=screenshot_path if has_screenshot else None,
             temperature=0.5,
-            max_tokens=4096
+            max_tokens=4096,
+            num_ctx=16384
         )
 
         # Extract task entries from the response
@@ -1786,7 +1901,7 @@ class GemmaSupervisor:
             q  = action.get("question", "What do you see?")
             full = os.path.join(WORKSPACE_DIR, fn)
             if os.path.exists(full):
-                resp = await self.prompt_gemma(q, image_path=full)
+                resp = await self.prompt_gemma(q, image_path=full, num_ctx=4096)
                 await self.set_last_output(f"Analysis of {fn}:\n{resp}")
             else:
                 await self.set_last_output(f"Image not found: {fn}")
@@ -1961,11 +2076,69 @@ class GemmaSupervisor:
             await self.log(f"ComfyUI error: {e}")
             await self.set_last_output(f"[GENERATE ERROR]: {e}")
 
+    # ── Studio control (pause / resume / switch) ────────────────────────────
+
+    async def _check_studio_commands(self):
+        """Poll pending_actions for pause/resume/switch commands from the dashboard."""
+        result = await self._api("get", "/api/studio/pending")
+        for action in result.get("actions", []):
+            atype   = action.get("type", "")
+            payload = action.get("payload", {})
+            if atype == "pause":
+                await self._enter_pause()
+                return  # _enter_pause owns its own command loop
+            elif atype == "switch_game":
+                slug = payload.get("slug", "")
+                if slug and slug != ACTIVE_GAME:
+                    await self._switch_game(slug)
+                    return  # os.execv — never reached
+
+    async def _enter_pause(self):
+        """Enter a slow-poll wait loop until resume or switch_game arrives."""
+        await self.log(f"[{ACTIVE_GAME}] PAUSED — waiting for resume or switch command.")
+        await self.push_state("mode", "PAUSED")
+        await self.push_state("supervisor_status", "paused")
+        self.git_commit("chore: pausing — checkpoint")
+        while not self._shutdown:
+            await asyncio.sleep(10)
+            result = await self._api("get", "/api/studio/pending")
+            for action in result.get("actions", []):
+                atype   = action.get("type", "")
+                payload = action.get("payload", {})
+                if atype == "resume":
+                    await self.log(f"[{ACTIVE_GAME}] RESUMED.")
+                    await self.push_state("supervisor_status", "running")
+                    return
+                elif atype == "switch_game":
+                    slug = payload.get("slug", "")
+                    if slug:
+                        await self._switch_game(slug)
+                        return  # os.execv — never reached
+
+    async def _switch_game(self, slug: str):
+        """Commit current work, update active game in studio_config, then restart."""
+        await self.log(f"Switching active game: {ACTIVE_GAME} → {slug}")
+        self.git_commit(f"chore: checkpoint before switching to {slug}")
+        try:
+            config = json.loads(open(_studio_config_path).read())
+        except Exception:
+            config = {}
+        config["active_game"] = slug
+        with open(_studio_config_path, "w") as f:
+            f.write(json.dumps(config, indent=2))
+        await self.log(f"studio_config.json updated. Restarting supervisor for '{slug}'...")
+        await asyncio.sleep(1)  # allow log to flush
+        # Remove PID lock so the restarted process can acquire it
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     async def run_loop(self):
         self.setup_signals()
         await self.initialize_workspace()
+        await self.push_state("supervisor_status", "running")
 
         state = await self.fetch_state()
         if self.iteration == 0:
@@ -1998,6 +2171,9 @@ class GemmaSupervisor:
                 else:
                     await self.log(f"Unknown mode '{mode}'. Defaulting to BUILD.")
                     self.set_mode("BUILD")
+
+                if not self._shutdown:
+                    await self._check_studio_commands()
 
                 self.iteration += 1
                 if not self._shutdown:

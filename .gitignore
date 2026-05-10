@@ -4,7 +4,7 @@ chroma_db/
 *.log
 media/
 .DS_Store
-game_workspace/
+games/
 __pycache__/
 *.pyc
 .vite/
